@@ -53,18 +53,25 @@ def prepare(qw):
 _compiled = {}
 
 
+def _ctas(N, M, nwg, bm):
+    return -(-N // (64 * nwg)) * -(-M // bm)
+
+
 def _config(M, N, K):
-    if M <= 64:
-        nwg, bm = (1 if N <= 4096 else 2), (64 if M > 32 else (32 if M > 16 else 16))
-    else:
-        nwg, bm = 2, 128
+    """(num_wg, BM, BK, split, stages); thresholds fitted to ncu sweeps (132 SMs)."""
     bk = 128 if (K // 128) % 2 == 0 else 64
-    ctas = -(-N // (64 * nwg)) * -(-M // bm)
+    if M <= 16:
+        nwg, bm, stages, target = 1, 16, 4, 132
+    else:
+        for nwg, bm, stages, target in ((1, 32, 4, 264), (1, 64, 4, 264), (2, 128, 0, 132)):
+            if _ctas(N, M, nwg, bm) <= 264:
+                break
+    ctas = _ctas(N, M, nwg, bm)
     split = 1
-    while (split < 8 and ctas * split * 2 <= 132 * 1.25 and (K // bk) % (4 * split) == 0
+    while (split < 8 and ctas * split * 2 <= target and (K // bk) % (4 * split) == 0
            and (2 * split - 1) * 64 * nwg * bm * 4 <= 72 * 1024):
         split *= 2
-    return (nwg, bm, bk, split)
+    return (nwg, bm, bk, split, stages)
 
 
 def _compile(cfg, N, K, Nb, G):
