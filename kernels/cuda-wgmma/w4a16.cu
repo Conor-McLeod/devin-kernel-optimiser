@@ -96,6 +96,28 @@ DEVI void dequant8(uint32_t q, uint32_t s0, uint32_t s1, uint32_t* a) {
   a[3] = bf2_sub_mul(lop3_and_or(q >> 12, MASK, EX), OFF, s1);
 }
 
+// Accumulator fragment (n = g / g+8, m = 2t, 2t+1) matches the stmatrix fragment; .trans writes epi[m][n].
+// (stmatrix epilogue idea from scout, board #50.)
+template <int BM, int STRIDE>
+DEVI void epi_stmatrix(__nv_bfloat16* epi, const float* acc, int nbase, int lane) {
+  const int mk = lane >> 3, mc = lane & 7;
+#pragma unroll
+  for (int i = 0; i < BM / 8; i += 2) {
+    uint32_t r[4];
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+      const int i2 = i + (k >> 1), h = k & 1;
+      __nv_bfloat162 v = __floats2bfloat162_rn(acc[4 * i2 + 2 * h], acc[4 * i2 + 2 * h + 1]);
+      r[k] = *reinterpret_cast<uint32_t*>(&v);
+    }
+    const int m = 8 * (i + (mk >> 1)) + mc;
+    const uint32_t addr = smem_u32(epi + m * STRIDE + nbase + 8 * (mk & 1));
+    asm volatile("stmatrix.sync.aligned.m8n8.x4.trans.shared.b16 [%0], {%1, %2, %3, %4};" ::"r"(addr), "r"(r[0]),
+                 "r"(r[1]), "r"(r[2]), "r"(r[3])
+                 : "memory");
+  }
+}
+
 template <int BM>
 struct Cfg {
   static constexpr int X_BYTES = BM * BK * 2;
@@ -242,15 +264,7 @@ __global__ void __launch_bounds__(384, 1)
   // Epilogue: transpose through smem ([m][n] bf16), then 16B coalesced stores.
   consumer_sync();
   __nv_bfloat16* epi = reinterpret_cast<__nv_bfloat16*>(smem);
-  const int nl = c * 64 + warp * 16 + g;
-#pragma unroll
-  for (int i = 0; i < BM / 8; ++i) {
-    const int m = 8 * i + 2 * t;
-    epi[m * C::EPI_STRIDE + nl] = __float2bfloat16_rn(acc[4 * i]);
-    epi[(m + 1) * C::EPI_STRIDE + nl] = __float2bfloat16_rn(acc[4 * i + 1]);
-    epi[m * C::EPI_STRIDE + nl + 8] = __float2bfloat16_rn(acc[4 * i + 2]);
-    epi[(m + 1) * C::EPI_STRIDE + nl + 8] = __float2bfloat16_rn(acc[4 * i + 3]);
-  }
+  epi_stmatrix<BM, C::EPI_STRIDE>(epi, acc, c * 64 + warp * 16, lane);
   consumer_sync();
   const int ctid = c * 128 + tid;
   const int n0 = tile_n * BN;
@@ -482,14 +496,7 @@ __global__ void __launch_bounds__(384, 1)
 
     // Epilogue: transpose through smem ([m][n] bf16), then 16B coalesced stores.
     consumer_sync();
-#pragma unroll
-    for (int q = 0; q < BM / 8; ++q) {
-      const int m = 8 * q + 2 * t;
-      epi[m * C::EPI_STRIDE + row] = __float2bfloat16_rn(acc[4 * q]);
-      epi[(m + 1) * C::EPI_STRIDE + row] = __float2bfloat16_rn(acc[4 * q + 1]);
-      epi[m * C::EPI_STRIDE + row + 8] = __float2bfloat16_rn(acc[4 * q + 2]);
-      epi[(m + 1) * C::EPI_STRIDE + row + 8] = __float2bfloat16_rn(acc[4 * q + 3]);
-    }
+    epi_stmatrix<BM, C::EPI_STRIDE>(epi, acc, c * 64 + warp * 16, lane);
     consumer_sync();
     const int n0 = tile_n * BN;
 #pragma unroll
