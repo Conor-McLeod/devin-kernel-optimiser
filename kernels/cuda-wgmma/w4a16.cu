@@ -153,18 +153,18 @@ __global__ void __launch_bounds__(384, 1)
 #pragma unroll
   for (int r = 0; r < C::NACC; ++r) acc[r] = 0.f;
 
-  for (int i = 0; i < nk; ++i) {
+  const int row = c * 64 + warp * 16 + g;
+  // Stage i: wait for TMA, dequantise into a, issue 4 wgmma, keep one wgmma group in flight.
+  auto step = [&](int i, uint32_t (&a)[4][4]) {
     const int s = i % STAGES;
     mbar_wait(&full[s], (i / STAGES) & 1);
     const uint8_t* st = smem + s * C::STAGE_BYTES;
     const uint4 q = reinterpret_cast<const uint4*>(st + C::X_BYTES)[c * 128 + tid];
     const __nv_bfloat16* sc = reinterpret_cast<const __nv_bfloat16*>(st + C::X_BYTES + W_BYTES);
-    const int row = c * 64 + warp * 16 + g;
     const __nv_bfloat162 s0b = __bfloat162bfloat162(sc[row]);
     const __nv_bfloat162 s1b = __bfloat162bfloat162(sc[row + 8]);
     const uint32_t s0 = *reinterpret_cast<const uint32_t*>(&s0b);
     const uint32_t s1 = *reinterpret_cast<const uint32_t*>(&s1b);
-    uint32_t a[4][4];
     dequant8(q.x, s0, s1, a[0]);
     dequant8(q.y, s0, s1, a[1]);
     dequant8(q.z, s0, s1, a[2]);
@@ -176,12 +176,24 @@ __global__ void __launch_bounds__(384, 1)
 #pragma unroll
     for (int j = 0; j < 4; ++j) wgmma_rs<BM>(acc, a[j], desc + 2 * j, 1);
     wg_commit();
-    wg_wait<0>();
 #pragma unroll
     for (int r = 0; r < C::NACC; ++r) fence_reg(acc[r]);
-    __syncwarp();
-    if (lane == 0) mbar_arrive(&empty[s]);
+    wg_wait<1>();
+    if (i > 0) {
+      __syncwarp();
+      if (lane == 0) mbar_arrive(&empty[(i - 1) % STAGES]);
+    }
+  };
+  uint32_t a0[4][4], a1[4][4];
+  int i = 0;
+  for (; i + 1 < nk; i += 2) {
+    step(i, a0);
+    step(i + 1, a1);
   }
+  if (i < nk) step(i, a0);
+  wg_wait<0>();
+#pragma unroll
+  for (int r = 0; r < C::NACC; ++r) fence_reg(acc[r]);
 
   if (nsplit > 1) {
     // Split-K: publish fp32 partial; the last CTA of this tile reduces and stores.

@@ -73,27 +73,32 @@ def prepare(qw):
     return {"wq": wq, "s": s, "N": N, "K": K}
 
 
+NUM_SMS = 132
+_CANDS = [(16, 1), (16, 2), (16, 4), (32, 1), (32, 2), (32, 4), (64, 1), (64, 2), (64, 4), (64, 8),
+          (128, 1), (128, 2), (128, 4), (256, 1), (256, 2)]
+
+
+def _est_us(M, N, K, bm, split):
+    """Wave-quantised cost model fitted to harness.bench sweeps (per-K-block CTA time is a latency
+    floor of ~0.25us for small tiles, ~linear in bm above that; split-K pays a fixed + workspace cost)."""
+    nt, mt = -(-N // 128), -(-M // bm)
+    ctas = nt * mt * split
+    t = -(-ctas // NUM_SMS) * -(-(K // 64) // split) * max(0.22, 0.09 + 0.0022 * bm)
+    if split > 1:
+        t += 1.0 + ctas * bm * 128 * 8 / 2e6
+    return t
+
+
 def _config(M, N, K):
-    nt = (N + 127) // 128
-    if M <= 16:
-        bm = 16
-    elif M <= 32:
-        bm = 32
-    elif M <= 64:
-        bm = 64
-    elif M <= 512:
-        bm = 128
-    else:
-        bm = 256
-    tiles = nt * ((M + bm - 1) // bm)
     kb = K // 64
-    split = 1
-    while tiles * split * 2 <= 132 and kb // (split * 2) >= 4:
-        split *= 2
-    return bm, split
+    cands = [(bm, s) for bm, s in _CANDS if s <= kb and (bm <= 16 or bm // 2 < M)]
+    return min(cands, key=lambda c: _est_us(M, N, K, *c))
+
+
+_OVERRIDE = os.environ.get("CUDA_WGMMA_CFG")  # "bm,split" for config sweeps
 
 
 def matmul(x, p):
     M, K = x.shape
-    bm, split = _config(M, p["N"], K)
+    bm, split = (int(v) for v in _OVERRIDE.split(",")) if _OVERRIDE else _config(M, p["N"], K)
     return _ext.w4a16_mm(x, p["wq"], p["s"], _counter_buf(x.device), p["N"], bm, split)
