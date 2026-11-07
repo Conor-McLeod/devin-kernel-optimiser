@@ -57,10 +57,27 @@ def _ctas(N, M, nwg, bm):
     return -(-N // (64 * nwg)) * -(-M // bm)
 
 
+def _prefill_config(M, N, K, bk):
+    # 1 CTA/SM for the 2-WG tiles: pick by wave count; a 128x256 tile costs ~1.72x a 128x128 one.
+    c128, c256 = _ctas(N, M, 2, 128), _ctas(N, M, 2, 256)
+    if c128 >= 128:
+        if -(-c256 // 132) * 1.72 < -(-c128 // 132):
+            return (2, 256, 64, 1, 0)
+        return (2, 128, bk, 1, 0)
+    if c128 * 2 >= 128 and (K // bk) % 4 == 0 and K // bk >= 16:
+        return (2, 128, bk, 2, 0)
+    for nwg, bm in ((1, 128), (1, 64)):
+        if _ctas(N, M, nwg, bm) >= 128:
+            break
+    return (nwg, bm, bk, 1, 4)
+
+
 def _config(M, N, K):
     """(num_wg, BM, BK, split, stages): largest tile giving >= 64 CTAs, then split-K
     towards ~132 CTAs. Fitted to ncu sweeps on 132-SM H100."""
     bk = 128 if (K // 128) % 2 == 0 else 64
+    if M >= 512:
+        return _prefill_config(M, N, K, bk)
     tiles = [t for t in ((2, 128, 0), (1, 64, 4), (1, 32, 4), (1, 16, 4)) if t[1] <= max(16, M)]
     for nwg, bm, stages in tiles:
         if _ctas(N, M, nwg, bm) >= 64:
