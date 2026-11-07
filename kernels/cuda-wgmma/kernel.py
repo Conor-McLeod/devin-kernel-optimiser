@@ -95,10 +95,20 @@ def _config(M, N, K):
     return min(cands, key=lambda c: _est_us(M, N, K, *c))
 
 
-_OVERRIDE = os.environ.get("CUDA_WGMMA_CFG")  # "bm,split" for config sweeps
+_OVERRIDE = os.environ.get("CUDA_WGMMA_CFG")  # "bm,ipc" for config sweeps
+
+
+def _launch_cfg(M, N, K):
+    """(bm, iterations-per-CTA). ipc a multiple of K/64 => persistent data-parallel tiles; ipc = kb/split => split-K."""
+    bm, split = _config(M, N, K)
+    kb = K // 64
+    if split > 1:
+        return bm, -(-kb // split)
+    tiles = -(-N // 128) * -(-M // bm)
+    return bm, -(-tiles // NUM_SMS) * kb
 
 
 def matmul(x, p):
     M, K = x.shape
-    bm, split = (int(v) for v in _OVERRIDE.split(",")) if _OVERRIDE else _config(M, p["N"], K)
-    return _ext.w4a16_mm(x, p["wq"], p["s"], _counter_buf(x.device), p["N"], bm, split)
+    bm, ipc = (int(v) for v in _OVERRIDE.split(",")) if _OVERRIDE else _launch_cfg(M, p["N"], K)
+    return _ext.w4a16_mm(x, p["wq"], p["s"], _counter_buf(x.device), p["N"], bm, 0, ipc)
