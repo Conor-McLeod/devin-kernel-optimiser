@@ -2,16 +2,18 @@
 #
 #   export NEBIUS_IAM_TOKEN=$(nebius iam get-access-token)   # valid 12h
 #   cp terraform.tfvars.example terraform.tfvars && $EDITOR terraform.tfvars
-#   terraform init && terraform apply
+#   tofu init && tofu apply
 #
 # Cost: ~$4.50/GPU-hour on demand (nebius.com/prices). Set `stopped = true` and
-# apply to pause overnight, `terraform destroy` when the hackathon is over.
+# apply to pause overnight, `tofu destroy` when the hackathon is over.
 
 terraform {
   required_version = ">= 1.5"
   required_providers {
     nebius = {
-      source  = "nebius/nebius"
+      # Full address: the OpenTofu registry doesn't carry the Nebius provider,
+      # so a bare "nebius/nebius" fails `tofu init`. This works with Terraform too.
+      source  = "registry.terraform.io/nebius/nebius"
       version = ">= 0.6.8"
     }
   }

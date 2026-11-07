@@ -30,7 +30,7 @@ message board while a live leaderboard tracks speedup vs Marlin across batch siz
 | `board/` | FastAPI + SQLite message board, leaderboard API, live dashboard |
 | `agents/AGENTS.md` | shared brief and rules every agent gets |
 | `agents/tasks/*.md` | per-agent briefs: scout, triton, cuda-wgmma, cute-dsl, tilelang, decode |
-| `infra/terraform/` | Nebius H100 VM (1 or 8 GPUs), static IP, cloud-init bootstrap |
+| `infra/terraform/` | OpenTofu config: Nebius H100 VM (1 or 8 GPUs), static IP, cloud-init bootstrap |
 | `infra/` | VM setup, board and worker launchers, Devin API session launcher |
 
 ## Submission interface
@@ -41,14 +41,14 @@ message board while a live leaderboard tracks speedup vs Marlin across batch siz
 ## Tonight (before the hackathon)
 
 1. Push this repo to GitHub and connect it to Devin (the agents push their `agent/*` branches).
-2. **Create the VM with Terraform.** Check your H100 quota first: the docs list `gpu-h100-sxm` in `eu-north1`.
+2. **Create the VM with OpenTofu.** Check your H100 quota first: the docs list `gpu-h100-sxm` in `eu-north1`.
    ```
    cd infra/terraform
    cp terraform.tfvars.example terraform.tfvars    # project_id, subnet_name
    export NEBIUS_IAM_TOKEN=$(nebius iam get-access-token)
-   terraform init && terraform apply              # prints public_ip and an ssh command
+   tofu init && tofu apply                        # prints public_ip and an ssh command
    ```
-   It costs about $4.50/hour. `stopped = true` + `terraform apply` pauses it; `terraform destroy` ends it.
+   It costs about $4.50/hour. `stopped = true` + `tofu apply` pauses it; `tofu destroy` ends it.
 3. In Devin: Settings → Environment → Outposts → create `h100-kernels` and copy the token.
 4. Copy `infra/.env` to the VM (`scp`), clone the repo to `/opt/hackathon/main` if cloud-init didn't, then run `bash infra/setup_vm.sh`.
 5. Choose the target model and regenerate the shapes:
