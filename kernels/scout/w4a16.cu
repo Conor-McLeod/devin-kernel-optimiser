@@ -108,7 +108,7 @@ template <int BM, bool PERSIST>
 __global__ void __launch_bounds__(384, 1)
     w4a16_kernel(const __grid_constant__ CUtensorMap tmx, const uint8_t* __restrict__ wq,
                  const __nv_bfloat16* __restrict__ ws, __nv_bfloat16* __restrict__ y, float* __restrict__ part,
-                 int* __restrict__ counters, int M, int N, int K, int kb_per_split) {
+                 int* __restrict__ counters, int M, int N, int K, int kb_per_split, int dp_tiles) {
   using C = Cfg<BM, PERSIST>;
   constexpr int STAGES = C::STAGES;
   extern __shared__ uint8_t smem_raw[];
@@ -117,8 +117,9 @@ __global__ void __launch_bounds__(384, 1)
   uint64_t* empty = full + STAGES;
   int* flag = reinterpret_cast<int*>(empty + STAGES);
 
-  // PERSIST = stream-K: CTA b owns work iterations [b*per, (b+1)*per) of the flattened (tile, k-block)
-  // space; tiles split across CTAs are reduced by the last arriving CTA (fp32 partials in `part`).
+  // PERSIST = hybrid data-parallel + stream-K. Tiles [0, dp_tiles) are whole tiles strided over CTAs;
+  // the remaining (tile, k-block) units are split evenly, CTA b owning [sk0 + b*per, sk0 + (b+1)*per).
+  // Tiles split across CTAs are reduced by the last arriving CTA (fp32 partials in `part`).
   const int split = PERSIST ? 0 : blockIdx.z, nsplit = PERSIST ? 1 : gridDim.z;
   const int ntn = (N + BN - 1) / BN;
   const int KB = K / BK, G = K / 128;
@@ -127,14 +128,28 @@ __global__ void __launch_bounds__(384, 1)
   const int nk = kb1 - kb0;
   const int per = kb_per_split;
   const int work = PERSIST ? ntn * ((M + BM - 1) / BM) * KB : nk;
-  const int beg = PERSIST ? blockIdx.x * per : 0;
-  const int end = PERSIST ? min(work, beg + per) : nk;
+  const int sk0 = dp_tiles * KB;
+  const int ndp = PERSIST ? max(0, (dp_tiles - static_cast<int>(blockIdx.x) + static_cast<int>(gridDim.x) - 1) /
+                                       static_cast<int>(gridDim.x))
+                          : 0;
+  const int sk_b = min(work, sk0 + static_cast<int>(blockIdx.x) * per);
+  const int sk_e = min(work, sk_b + per);
+  const int beg = 0;
+  const int end = PERSIST ? ndp * KB + (sk_e - sk_b) : nk;
   const int wg = threadIdx.x / 128, tid = threadIdx.x % 128;
   auto segment = [&](int cur, int& tile_n, int& tile_m, int& kbeg, int& kend) {
     if (PERSIST) {
-      const int tile = cur / KB;
-      kbeg = cur % KB;
-      kend = min(KB, kbeg + (end - cur));
+      int tile;
+      if (cur < ndp * KB) {
+        tile = blockIdx.x + (cur / KB) * gridDim.x;
+        kbeg = 0;
+        kend = KB;
+      } else {
+        const int real = sk_b + (cur - ndp * KB);
+        tile = real / KB;
+        kbeg = real % KB;
+        kend = min(KB, kbeg + (sk_e - real));
+      }
       tile_n = tile % ntn;
       tile_m = tile / ntn;
     } else {
@@ -220,7 +235,6 @@ __global__ void __launch_bounds__(384, 1)
   int tile_n, tile_m, kbeg, kend;
   segment(cur, tile_n, tile_m, kbeg, kend);
   const int nseg = kend - kbeg;
-  const bool first_seg = (cur == beg);
   cur += nseg;
 #pragma unroll
   for (int r = 0; r < C::NACC; ++r) acc[r] = 0.f;
@@ -243,12 +257,12 @@ __global__ void __launch_bounds__(384, 1)
   if (partial) {
     // Publish fp32 partial; the last CTA to arrive for this tile reduces and stores.
     const int tile_lin = tile_m * ntn + tile_n;
-    const size_t tstart = static_cast<size_t>(tile_lin) * KB;
-    const int g_first = PERSIST ? static_cast<int>(tstart / per) : 0;
-    const int g_last = PERSIST ? static_cast<int>((tstart + KB - 1) / per) : nsplit - 1;
+    const int tstart = tile_lin * KB - sk0;
+    const int g_first = PERSIST ? tstart / per : 0;
+    const int g_last = PERSIST ? (tstart + KB - 1) / per : nsplit - 1;
     const int me = PERSIST ? static_cast<int>(blockIdx.x) : split;
     auto slot = [&](int gq) -> size_t {
-      if (PERSIST) return static_cast<size_t>(gq) * 2 + (static_cast<size_t>(gq) * per >= tstart ? 0 : 1);
+      if (PERSIST) return static_cast<size_t>(gq) * 2 + (gq * per >= tstart ? 0 : 1);
       return static_cast<size_t>(tile_lin) * nsplit + gq;
     };
     float4* mine = reinterpret_cast<float4*>(part + slot(me) * BM * BN);
@@ -340,7 +354,7 @@ int num_sms() {
 
 template <int BM, bool PERSIST>
 void launch(const torch::Tensor& x, const torch::Tensor& wq, const torch::Tensor& ws, torch::Tensor& y,
-            torch::Tensor& counters, int N, int split, cudaStream_t stream) {
+            torch::Tensor& counters, int N, int split, bool stream_k, cudaStream_t stream) {
   // PERSIST: `split` is the minimum number of k-blocks per CTA (stream-K granularity).
   using C = Cfg<BM, PERSIST>;
   const int M = x.size(0), K = x.size(1);
@@ -354,14 +368,24 @@ void launch(const torch::Tensor& x, const torch::Tensor& wq, const torch::Tensor
   TORCH_CHECK(counters.numel() >= ntiles * mtiles, "counter buffer too small");
   torch::Tensor part;
   float* part_ptr = nullptr;
-  int grid_x, kbps;
+  int grid_x, kbps, dp_tiles = 0;
   if (PERSIST) {
-    const int work = ntiles * mtiles * KB;
+    const int T = ntiles * mtiles, g = num_sms();
     const int min_per = std::max(1, split);
-    int g = std::min(num_sms(), std::max(1, work / min_per));
-    kbps = (work + g - 1) / g;
-    grid_x = (work + kbps - 1) / kbps;
-    if (kbps % KB != 0 || work % kbps != 0) {
+    const int rem = T % g;
+    if (!stream_k || rem == 0 || T < g / 2) {
+      dp_tiles = T;
+      kbps = KB;
+      grid_x = std::min(T, g);
+    } else {
+      dp_tiles = T - rem;
+      const int skw = rem * KB;
+      const int skc = std::min(g, std::max(1, skw / min_per));
+      kbps = (skw + skc - 1) / skc;
+      const int ctas = (skw + kbps - 1) / kbps;
+      grid_x = dp_tiles > 0 ? g : ctas;
+    }
+    if (kbps % KB != 0) {
       part = torch::empty({static_cast<int64_t>(grid_x) * 2 * BM * BN}, x.options().dtype(torch::kFloat32));
       part_ptr = part.data_ptr<float>();
     }
@@ -380,7 +404,7 @@ void launch(const torch::Tensor& x, const torch::Tensor& wq, const torch::Tensor
   dim3 grid = PERSIST ? dim3(grid_x) : dim3(ntiles, mtiles, split);
   w4a16_kernel<BM, PERSIST><<<grid, 384, C::SMEM, stream>>>(
       map, wq.data_ptr<uint8_t>(), reinterpret_cast<const __nv_bfloat16*>(ws.data_ptr()),
-      reinterpret_cast<__nv_bfloat16*>(y.data_ptr()), part_ptr, counters.data_ptr<int>(), M, N, K, kbps);
+      reinterpret_cast<__nv_bfloat16*>(y.data_ptr()), part_ptr, counters.data_ptr<int>(), M, N, K, kbps, dp_tiles);
 }
 
 }  // namespace
@@ -394,19 +418,19 @@ torch::Tensor w4a16_mm(torch::Tensor x, torch::Tensor wq, torch::Tensor ws, torc
   if (persist) {
     // persist > 0: stream-K, `split` = minimum k-blocks per CTA.
     switch (bm) {
-      case 64: launch<64, true>(x, wq, ws, y, counters, N, split, stream); break;
-      case 128: launch<128, true>(x, wq, ws, y, counters, N, split, stream); break;
-      case 256: launch<256, true>(x, wq, ws, y, counters, N, split, stream); break;
+      case 64: launch<64, true>(x, wq, ws, y, counters, N, split, persist > 1, stream); break;
+      case 128: launch<128, true>(x, wq, ws, y, counters, N, split, persist > 1, stream); break;
+      case 256: launch<256, true>(x, wq, ws, y, counters, N, split, persist > 1, stream); break;
       default: TORCH_CHECK(false, "bad bm for persist");
     }
     return y;
   }
   switch (bm) {
-    case 16: launch<16, false>(x, wq, ws, y, counters, N, split, stream); break;
-    case 32: launch<32, false>(x, wq, ws, y, counters, N, split, stream); break;
-    case 64: launch<64, false>(x, wq, ws, y, counters, N, split, stream); break;
-    case 128: launch<128, false>(x, wq, ws, y, counters, N, split, stream); break;
-    case 256: launch<256, false>(x, wq, ws, y, counters, N, split, stream); break;
+    case 16: launch<16, false>(x, wq, ws, y, counters, N, split, false, stream); break;
+    case 32: launch<32, false>(x, wq, ws, y, counters, N, split, false, stream); break;
+    case 64: launch<64, false>(x, wq, ws, y, counters, N, split, false, stream); break;
+    case 128: launch<128, false>(x, wq, ws, y, counters, N, split, false, stream); break;
+    case 256: launch<256, false>(x, wq, ws, y, counters, N, split, false, stream); break;
     default: TORCH_CHECK(false, "bad bm");
   }
   return y;

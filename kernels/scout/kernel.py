@@ -109,7 +109,7 @@ def matmul(x, p):
         bm, split, persist = v[0], v[1], (v[2] if len(v) > 2 else 0)
     else:
         bm, split = _config(M, p["N"], K)
-        persist = int(split == 1 and bm >= 64 and M >= 512)
+        persist = 2 * int(split == 1 and bm >= 64 and M >= 512)
         if persist:
             split = _MIN_PER  # stream-K: minimum k-blocks per CTA
     return _ext.w4a16_mm(x, p["wq"], p["s"], _counter_buf(x.device), p["N"], bm, split, persist)
