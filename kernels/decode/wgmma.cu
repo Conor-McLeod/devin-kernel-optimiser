@@ -93,41 +93,44 @@ template <int BM>
 struct Cfg {
   static constexpr int X_BYTES = BM * BK * 2;
   static constexpr int STAGE_BYTES = ((X_BYTES + W_BYTES + S_BYTES + 1023) / 1024) * 1024;
-  static constexpr int STAGES_RAW = 200 * 1024 / STAGE_BYTES;
-  static constexpr int STAGES = STAGES_RAW > 8 ? 8 : STAGES_RAW;
   static constexpr int EPI_STRIDE = BN + 8;
-  static constexpr int EPI_BYTES = BM * EPI_STRIDE * 2;
+  static constexpr int EPI_BYTES = ((BM * EPI_STRIDE * 2 + 1023) / 1024) * 1024;
+  static constexpr int STAGES_RAW = (225 * 1024 - EPI_BYTES) / STAGE_BYTES;
+  static constexpr int STAGES = STAGES_RAW > 8 ? 8 : STAGES_RAW;
   static constexpr int PIPE_BYTES = STAGES * STAGE_BYTES;
-  static constexpr int BAR_OFF = PIPE_BYTES > EPI_BYTES ? PIPE_BYTES : EPI_BYTES;
+  static constexpr int BAR_OFF = PIPE_BYTES + EPI_BYTES;
   static constexpr int SMEM = 1024 + BAR_OFF + 2 * STAGES * 8 + 16;
   static constexpr int NACC = BM / 2;
 };
 
+// Persistent: CTA b handles work items b, b+gridDim.x, ... Items [0,D) are full-K tiles, items
+// [D, D+R*S) are split-K pieces of the remaining R tiles. The TMA producer runs ahead across items;
+// the epilogue has its own smem so the next item's loads overlap it.
 template <int BM>
 __global__ void __launch_bounds__(384, 1)
     w4a16_kernel(const __grid_constant__ CUtensorMap tmx, const uint8_t* __restrict__ wq,
                  const __nv_bfloat16* __restrict__ ws, __nv_bfloat16* __restrict__ y, float* __restrict__ part,
-                 int* __restrict__ counters, int M, int N, int K, int kb_per_split, int ntn, int D, int S) {
+                 int* __restrict__ counters, int M, int N, int K, int kb_per_split, int ntn, int D, int S,
+                 int nitems) {
   using C = Cfg<BM>;
   constexpr int STAGES = C::STAGES;
   extern __shared__ uint8_t smem_raw[];
   uint8_t* smem = reinterpret_cast<uint8_t*>((reinterpret_cast<uintptr_t>(smem_raw) + 1023) & ~uintptr_t(1023));
+  __nv_bfloat16* epi = reinterpret_cast<__nv_bfloat16*>(smem + C::PIPE_BYTES);
   uint64_t* full = reinterpret_cast<uint64_t*>(smem + C::BAR_OFF);
   uint64_t* empty = full + STAGES;
   int* flag = reinterpret_cast<int*>(empty + STAGES);
 
   const int KB = K / BK, G = K / 128;
-  const int b = blockIdx.x;
-  int tile, split, nsplit, kb0, kb1;
-  if (b < D) {
-    tile = b; split = 0; nsplit = 1; kb0 = 0; kb1 = KB;
-  } else {
-    tile = D + (b - D) / S; split = (b - D) % S; nsplit = S;
-    kb0 = split * kb_per_split; kb1 = min(KB, kb0 + kb_per_split);
-  }
-  const int tile_n = tile % ntn, tile_m = tile / ntn;
-  const int nk = kb1 - kb0;
   const int wg = threadIdx.x / 128, tid = threadIdx.x % 128;
+  auto item = [&](int w, int& tile, int& split, int& nsplit, int& kb0, int& kb1) {
+    if (w < D) {
+      tile = w; split = 0; nsplit = 1; kb0 = 0; kb1 = KB;
+    } else {
+      tile = D + (w - D) / S; split = (w - D) % S; nsplit = S;
+      kb0 = split * kb_per_split; kb1 = min(KB, kb0 + kb_per_split);
+    }
+  };
 
   if (threadIdx.x == 0) {
     for (int s = 0; s < STAGES; ++s) {
@@ -141,16 +144,22 @@ __global__ void __launch_bounds__(384, 1)
   if (wg == 0) {
     asm volatile("setmaxnreg.dec.sync.aligned.u32 40;");
     if (tid == 0) {
-      const uint8_t* wsrc = wq + (static_cast<size_t>(tile_n) * KB + kb0) * W_BYTES;
-      const __nv_bfloat16* ssrc = ws + static_cast<size_t>(tile_n) * G * BN;
-      for (int i = 0; i < nk; ++i) {
-        const int s = i % STAGES;
-        if (i >= STAGES) mbar_wait(&empty[s], ((i / STAGES) - 1) & 1);
-        uint8_t* st = smem + s * C::STAGE_BYTES;
-        mbar_expect_tx(&full[s], C::X_BYTES + W_BYTES + S_BYTES);
-        tma_load_2d(st, &tmx, &full[s], (kb0 + i) * BK, tile_m * BM);
-        bulk_load(st + C::X_BYTES, wsrc + static_cast<size_t>(i) * W_BYTES, W_BYTES, &full[s]);
-        bulk_load(st + C::X_BYTES + W_BYTES, ssrc + ((kb0 + i) >> 1) * BN, S_BYTES, &full[s]);
+      int it = 0;
+      for (int w = blockIdx.x; w < nitems; w += gridDim.x) {
+        int tile, split, nsplit, kb0, kb1;
+        item(w, tile, split, nsplit, kb0, kb1);
+        const int tile_n = tile % ntn, tile_m = tile / ntn;
+        const uint8_t* wsrc = wq + (static_cast<size_t>(tile_n) * KB + kb0) * W_BYTES;
+        const __nv_bfloat16* ssrc = ws + static_cast<size_t>(tile_n) * G * BN;
+        for (int i = 0; i < kb1 - kb0; ++i, ++it) {
+          const int s = it % STAGES;
+          if (it >= STAGES) mbar_wait(&empty[s], ((it / STAGES) - 1) & 1);
+          uint8_t* st = smem + s * C::STAGE_BYTES;
+          mbar_expect_tx(&full[s], C::X_BYTES + W_BYTES + S_BYTES);
+          tma_load_2d(st, &tmx, &full[s], (kb0 + i) * BK, tile_m * BM);
+          bulk_load(st + C::X_BYTES, wsrc + static_cast<size_t>(i) * W_BYTES, W_BYTES, &full[s]);
+          bulk_load(st + C::X_BYTES + W_BYTES, ssrc + ((kb0 + i) >> 1) * BN, S_BYTES, &full[s]);
+        }
       }
     }
     return;
@@ -158,107 +167,117 @@ __global__ void __launch_bounds__(384, 1)
 
   asm volatile("setmaxnreg.inc.sync.aligned.u32 232;");
   const int c = wg - 1, warp = tid / 32, lane = tid % 32, g = lane / 4, t = lane % 4;
-  float acc[C::NACC];
-#pragma unroll
-  for (int r = 0; r < C::NACC; ++r) acc[r] = 0.f;
-
   const int row = c * 64 + warp * 16 + g;
-  // Stage i: wait for TMA, dequantise into a, issue 4 wgmma, keep one wgmma group in flight.
-  auto step = [&](int i, uint32_t (&a)[4][4]) {
-    const int s = i % STAGES;
-    mbar_wait(&full[s], (i / STAGES) & 1);
-    const uint8_t* st = smem + s * C::STAGE_BYTES;
-    const uint4 q = reinterpret_cast<const uint4*>(st + C::X_BYTES)[c * 128 + tid];
-    const __nv_bfloat16* sc = reinterpret_cast<const __nv_bfloat16*>(st + C::X_BYTES + W_BYTES);
-    const __nv_bfloat162 s0b = __bfloat162bfloat162(sc[row]);
-    const __nv_bfloat162 s1b = __bfloat162bfloat162(sc[row + 8]);
-    const uint32_t s0 = *reinterpret_cast<const uint32_t*>(&s0b);
-    const uint32_t s1 = *reinterpret_cast<const uint32_t*>(&s1b);
-    dequant8(q.x, s0, s1, a[0]);
-    dequant8(q.y, s0, s1, a[1]);
-    dequant8(q.z, s0, s1, a[2]);
-    dequant8(q.w, s0, s1, a[3]);
-    const uint64_t desc = make_desc_sw128(smem_u32(st));
+  float acc[C::NACC];
+  int it = 0;
+  for (int w = blockIdx.x; w < nitems; w += gridDim.x) {
+    int tile, split, nsplit, kb0, kb1;
+    item(w, tile, split, nsplit, kb0, kb1);
+    const int tile_n = tile % ntn, tile_m = tile / ntn;
+    const int nk = kb1 - kb0;
 #pragma unroll
-    for (int r = 0; r < C::NACC; ++r) fence_reg(acc[r]);
-    wg_fence();
+    for (int r = 0; r < C::NACC; ++r) acc[r] = 0.f;
+    const int it0 = it;
+    // Stage i: wait for TMA, dequantise into a, issue 4 wgmma, keep one wgmma group in flight.
+    auto step = [&](int i, uint32_t (&a)[4][4]) {
+      const int s = i % STAGES;
+      mbar_wait(&full[s], (i / STAGES) & 1);
+      const uint8_t* st = smem + s * C::STAGE_BYTES;
+      const uint4 q = reinterpret_cast<const uint4*>(st + C::X_BYTES)[c * 128 + tid];
+      const __nv_bfloat16* sc = reinterpret_cast<const __nv_bfloat16*>(st + C::X_BYTES + W_BYTES);
+      const __nv_bfloat162 s0b = __bfloat162bfloat162(sc[row]);
+      const __nv_bfloat162 s1b = __bfloat162bfloat162(sc[row + 8]);
+      const uint32_t s0 = *reinterpret_cast<const uint32_t*>(&s0b);
+      const uint32_t s1 = *reinterpret_cast<const uint32_t*>(&s1b);
+      dequant8(q.x, s0, s1, a[0]);
+      dequant8(q.y, s0, s1, a[1]);
+      dequant8(q.z, s0, s1, a[2]);
+      dequant8(q.w, s0, s1, a[3]);
+      const uint64_t desc = make_desc_sw128(smem_u32(st));
 #pragma unroll
-    for (int j = 0; j < 4; ++j) wgmma_rs<BM>(acc, a[j], desc + 2 * j, 1);
-    wg_commit();
+      for (int r = 0; r < C::NACC; ++r) fence_reg(acc[r]);
+      wg_fence();
 #pragma unroll
-    for (int r = 0; r < C::NACC; ++r) fence_reg(acc[r]);
-    wg_wait<1>();
-    if (i > 0) {
-      __syncwarp();
-      if (lane == 0) mbar_arrive(&empty[(i - 1) % STAGES]);
+      for (int j = 0; j < 4; ++j) wgmma_rs<BM>(acc, a[j], desc + 2 * j, 1);
+      wg_commit();
+#pragma unroll
+      for (int r = 0; r < C::NACC; ++r) fence_reg(acc[r]);
+      wg_wait<1>();
+      if (i > it0) {
+        __syncwarp();
+        if (lane == 0) mbar_arrive(&empty[(i - 1) % STAGES]);
+      }
+    };
+    uint32_t a0[4][4], a1[4][4];
+    const int it1 = it0 + nk;
+    for (; it + 1 < it1; it += 2) {
+      step(it, a0);
+      step(it + 1, a1);
     }
-  };
-  uint32_t a0[4][4], a1[4][4];
-  int i = 0;
-  for (; i + 1 < nk; i += 2) {
-    step(i, a0);
-    step(i + 1, a1);
-  }
-  if (i < nk) step(i, a0);
-  wg_wait<0>();
+    if (it < it1) { step(it, a0); ++it; }
+    wg_wait<0>();
 #pragma unroll
-  for (int r = 0; r < C::NACC; ++r) fence_reg(acc[r]);
+    for (int r = 0; r < C::NACC; ++r) fence_reg(acc[r]);
+    __syncwarp();
+    if (lane == 0) mbar_arrive(&empty[(it1 - 1) % STAGES]);
 
-  if (nsplit > 1) {
-    // Split-K: publish fp32 partial; the last CTA of this tile reduces and stores.
-    const int tile_lin = tile - D;
-    const int ctid = c * 128 + tid;
-    float4* mine = reinterpret_cast<float4*>(part + (static_cast<size_t>(tile_lin) * nsplit + split) * BM * BN);
+    if (nsplit > 1) {
+      // Split-K: publish fp32 partial; the last CTA of this tile reduces and stores.
+      const int tile_lin = tile - D;
+      const int ctid = c * 128 + tid;
+      float4* mine = reinterpret_cast<float4*>(part + (static_cast<size_t>(tile_lin) * nsplit + split) * BM * BN);
 #pragma unroll
-    for (int r = 0; r < C::NACC / 4; ++r)
-      mine[r * 256 + ctid] = make_float4(acc[4 * r], acc[4 * r + 1], acc[4 * r + 2], acc[4 * r + 3]);
-    __threadfence();
-    consumer_sync();
-    if (ctid == 0) {
-      const int old = atomicAdd(&counters[tile_lin], 1);
-      const int last = (old == nsplit - 1);
-      if (last) counters[tile_lin] = 0;
-      *flag = last;
-    }
-    consumer_sync();
-    if (!*flag) return;
-    __threadfence();
-    for (int sp = 0; sp < nsplit; ++sp) {
-      if (sp == split) continue;
-      const float4* other =
-          reinterpret_cast<const float4*>(part + (static_cast<size_t>(tile_lin) * nsplit + sp) * BM * BN);
+      for (int r = 0; r < C::NACC / 4; ++r)
+        mine[r * 256 + ctid] = make_float4(acc[4 * r], acc[4 * r + 1], acc[4 * r + 2], acc[4 * r + 3]);
+      __threadfence();
+      consumer_sync();
+      if (ctid == 0) {
+        const int old = atomicAdd(&counters[tile_lin], 1);
+        const int last = (old == nsplit - 1);
+        if (last) counters[tile_lin] = 0;
+        *flag = last;
+      }
+      consumer_sync();
+      const int last = *flag;
+      consumer_sync();
+      if (!last) continue;
+      __threadfence();
+      for (int sp = 0; sp < nsplit; ++sp) {
+        if (sp == split) continue;
+        const float4* other =
+            reinterpret_cast<const float4*>(part + (static_cast<size_t>(tile_lin) * nsplit + sp) * BM * BN);
 #pragma unroll
-      for (int r = 0; r < C::NACC / 4; ++r) {
-        const float4 v = __ldcg(&other[r * 256 + ctid]);
-        acc[4 * r] += v.x;
-        acc[4 * r + 1] += v.y;
-        acc[4 * r + 2] += v.z;
-        acc[4 * r + 3] += v.w;
+        for (int r = 0; r < C::NACC / 4; ++r) {
+          const float4 v = __ldcg(&other[r * 256 + ctid]);
+          acc[4 * r] += v.x;
+          acc[4 * r + 1] += v.y;
+          acc[4 * r + 2] += v.z;
+          acc[4 * r + 3] += v.w;
+        }
       }
     }
-  }
 
-  // Epilogue: transpose through smem ([m][n] bf16), then 16B coalesced stores.
-  consumer_sync();
-  __nv_bfloat16* epi = reinterpret_cast<__nv_bfloat16*>(smem);
-  const int nl = c * 64 + warp * 16 + g;
+    // Epilogue (per warpgroup, own 64 columns of the [m][n] smem tile), then 16B coalesced stores.
+    asm volatile("bar.sync %0, 128;" ::"r"(2 + c) : "memory");
+    const int nl = c * 64 + warp * 16 + g;
 #pragma unroll
-  for (int i = 0; i < BM / 8; ++i) {
-    const int m = 8 * i + 2 * t;
-    epi[m * C::EPI_STRIDE + nl] = __float2bfloat16_rn(acc[4 * i]);
-    epi[(m + 1) * C::EPI_STRIDE + nl] = __float2bfloat16_rn(acc[4 * i + 1]);
-    epi[m * C::EPI_STRIDE + nl + 8] = __float2bfloat16_rn(acc[4 * i + 2]);
-    epi[(m + 1) * C::EPI_STRIDE + nl + 8] = __float2bfloat16_rn(acc[4 * i + 3]);
-  }
-  consumer_sync();
-  const int ctid = c * 128 + tid;
-  const int n0 = tile_n * BN;
-  for (int idx = ctid; idx < BM * 16; idx += 256) {
-    const int m = idx / 16, ch = idx % 16;
-    const int gm = tile_m * BM + m, gn = n0 + ch * 8;
-    if (gm < M && gn < N) {
-      const uint4 v = *reinterpret_cast<const uint4*>(epi + m * C::EPI_STRIDE + ch * 8);
-      *reinterpret_cast<uint4*>(y + static_cast<size_t>(gm) * N + gn) = v;
+    for (int i = 0; i < BM / 8; ++i) {
+      const int m = 8 * i + 2 * t;
+      epi[m * C::EPI_STRIDE + nl] = __float2bfloat16_rn(acc[4 * i]);
+      epi[(m + 1) * C::EPI_STRIDE + nl] = __float2bfloat16_rn(acc[4 * i + 1]);
+      epi[m * C::EPI_STRIDE + nl + 8] = __float2bfloat16_rn(acc[4 * i + 2]);
+      epi[(m + 1) * C::EPI_STRIDE + nl + 8] = __float2bfloat16_rn(acc[4 * i + 3]);
+    }
+    asm volatile("bar.sync %0, 128;" ::"r"(2 + c) : "memory");
+    const int n0 = tile_n * BN + c * 64;
+#pragma unroll 4
+    for (int idx = tid; idx < BM * 8; idx += 128) {
+      const int m = idx / 8, ch = idx % 8;
+      const int gm = tile_m * BM + m, gn = n0 + ch * 8;
+      if (gm < M && gn < N) {
+        const uint4 v = *reinterpret_cast<const uint4*>(epi + m * C::EPI_STRIDE + c * 64 + ch * 8);
+        *reinterpret_cast<uint4*>(y + static_cast<size_t>(gm) * N + gn) = v;
+      }
     }
   }
 }
@@ -278,7 +297,7 @@ CUtensorMap make_x_map(const void* ptr, int M, int K, int box_m) {
 
 template <int BM>
 void launch(const torch::Tensor& x, const torch::Tensor& wq, const torch::Tensor& ws, torch::Tensor& y,
-            torch::Tensor& counters, torch::Tensor& part, int N, int D, int S, cudaStream_t stream) {
+            torch::Tensor& counters, torch::Tensor& part, int N, int D, int S, int ctas, cudaStream_t stream) {
   using C = Cfg<BM>;
   const int M = x.size(0), K = x.size(1);
   const int KB = K / BK;
@@ -302,26 +321,27 @@ void launch(const torch::Tensor& x, const torch::Tensor& wq, const torch::Tensor
     part_ptr = part.data_ptr<float>();
   }
   CUtensorMap map = make_x_map(x.data_ptr(), M, K, BM);
-  dim3 grid(D + R * S);
+  const int nitems = D + R * S;
+  dim3 grid(ctas > 0 ? std::min(ctas, nitems) : nitems);
   w4a16_kernel<BM><<<grid, 384, C::SMEM, stream>>>(
       map, wq.data_ptr<uint8_t>(), reinterpret_cast<const __nv_bfloat16*>(ws.data_ptr()),
-      reinterpret_cast<__nv_bfloat16*>(y.data_ptr()), part_ptr, counters.data_ptr<int>(), M, N, K, kbps, ntn, D, S);
+      reinterpret_cast<__nv_bfloat16*>(y.data_ptr()), part_ptr, counters.data_ptr<int>(), M, N, K, kbps, ntn, D, S, nitems);
 }
 
 }  // namespace
 
 torch::Tensor w4a16_mm(torch::Tensor x, torch::Tensor wq, torch::Tensor ws, torch::Tensor counters, torch::Tensor part,
-                       int64_t N, int64_t bm, int64_t D, int64_t S) {
+                       int64_t N, int64_t bm, int64_t D, int64_t S, int64_t ctas) {
   TORCH_CHECK(x.is_contiguous() && x.scalar_type() == torch::kBFloat16);
   const at::cuda::CUDAGuard guard(x.device());
   auto y = torch::empty({x.size(0), N}, x.options());
   cudaStream_t stream = at::cuda::getCurrentCUDAStream();
   switch (bm) {
-    case 16: launch<16>(x, wq, ws, y, counters, part, N, D, S, stream); break;
-    case 32: launch<32>(x, wq, ws, y, counters, part, N, D, S, stream); break;
-    case 64: launch<64>(x, wq, ws, y, counters, part, N, D, S, stream); break;
-    case 128: launch<128>(x, wq, ws, y, counters, part, N, D, S, stream); break;
-    case 256: launch<256>(x, wq, ws, y, counters, part, N, D, S, stream); break;
+    case 16: launch<16>(x, wq, ws, y, counters, part, N, D, S, ctas, stream); break;
+    case 32: launch<32>(x, wq, ws, y, counters, part, N, D, S, ctas, stream); break;
+    case 64: launch<64>(x, wq, ws, y, counters, part, N, D, S, ctas, stream); break;
+    case 128: launch<128>(x, wq, ws, y, counters, part, N, D, S, ctas, stream); break;
+    case 256: launch<256>(x, wq, ws, y, counters, part, N, D, S, ctas, stream); break;
     default: TORCH_CHECK(false, "bad bm");
   }
   return y;

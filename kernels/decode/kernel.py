@@ -158,8 +158,12 @@ def _wg_cfg(M, N, K):
     if key in _sched:
         return _sched[key]
     env = os.environ.get("DECODE_WG")
-    if env:
-        cfg = tuple(int(v) for v in env.split(","))
+    if env:  # "bm,mode,S": mode -1 = all tiles split, 0 = T%nsm tail tiles split, 1 = T%nsm+nsm
+        bm, mode, S = (int(v) for v in env.split(","))
+        T = -(-N // 128) * -(-M // bm)
+        nsm = _nsm or 132
+        R = T if mode < 0 or S == 1 else min(T, T % nsm + mode * nsm)
+        cfg = (bm, T - R, S)
     else:
         nsm = _nsm or 132
         KB = K // 64
@@ -199,7 +203,8 @@ def matmul(x, p):
         bm, D, S = _wg_cfg(M, N, K)
         T = -(-N // 128) * -(-M // bm)
         cnt, part = _wg_bufs(x.device, (T - D) * S * bm * 128)
-        return _ext("wgmma").w4a16_mm(x, p["wq"], p["wsc"], cnt, part, N, bm, D, S)
+        ctas = (_nsm or 132) if os.environ.get("DECODE_P", "1") == "1" else 0
+        return _ext("wgmma").w4a16_mm(x, p["wq"], p["wsc"], cnt, part, N, bm, D, S, ctas)
     y = torch.empty(M, N, dtype=torch.bfloat16, device=x.device)
     impl = _impl()
     ext = _ext(impl)
