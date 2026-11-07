@@ -22,6 +22,18 @@ One-liner: we pointed a team of Devin agents at a real production kernel and let
 -->
 
 ---
+
+# What is W4A16?
+
+<W4A16Explainer />
+
+<!--
+Tab 1: drag bits from 16 down to 2. Model goes 70 GB → 18 GB at 4 bits; error jumps at 3 and 2.
+Tab 2: drag M from 1 to 4096. Small M: ~4x faster because the GPU just waits on memory. Large M: no gain, it's arithmetic-bound.
+Tab 3: step through unpacking one byte. This unpack-then-multiply loop is the whole kernel, and Marlin does it with Ampere-era tools.
+-->
+
+---
 layout: two-cols
 layoutClass: gap-10
 ---
