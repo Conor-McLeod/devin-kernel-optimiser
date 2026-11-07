@@ -161,16 +161,17 @@ __global__ void __launch_bounds__(384, Cfg<BM>::OCC)
   if (wg == 0) {
     asm volatile("setmaxnreg.dec.sync.aligned.u32 %0;" ::"n"(C::REG_P));
     if (tid == 0) {
-      int it = 0;
+      int ps = 0, pr = 0;
       for (int w = blockIdx.x; w < nitems; w += gridDim.x) {
         int tile, split, nsplit, kb0, kb1;
         item(w, tile, split, nsplit, kb0, kb1);
         const int tile_n = tile % ntn, tile_m = tile / ntn;
         const uint8_t* wsrc = wq + (static_cast<size_t>(tile_n) * KB + kb0) * W_BYTES;
         const __nv_bfloat16* ssrc = ws + static_cast<size_t>(tile_n) * G * BN;
-        for (int i = 0; i < kb1 - kb0; ++i, ++it) {
-          const int s = it % STAGES;
-          if (it >= STAGES) mbar_wait(&empty[s], ((it / STAGES) - 1) & 1);
+        for (int i = 0; i < kb1 - kb0; ++i) {
+          const int s = ps;
+          if (pr > 0) mbar_wait(&empty[s], (pr - 1) & 1);
+          if (++ps == STAGES) { ps = 0; ++pr; }
           uint8_t* st = smem + s * C::STAGE_BYTES;
           mbar_expect_tx(&full[s], C::X_BYTES + W_BYTES + S_BYTES);
           tma_load_2d(st, &tmx, &full[s], (kb0 + i) * BK, tile_m * BM);
@@ -186,7 +187,8 @@ __global__ void __launch_bounds__(384, Cfg<BM>::OCC)
   const int c = wg - 1, warp = tid / 32, lane = tid % 32, g = lane / 4, t = lane % 4;
   const int row = c * 64 + warp * 16 + g;
   float acc[C::NACC];
-  int it = 0;
+  int cs = 0;
+  uint32_t cph = 0;
   for (int w = blockIdx.x; w < nitems; w += gridDim.x) {
     int tile, split, nsplit, kb0, kb1;
     item(w, tile, split, nsplit, kb0, kb1);
@@ -194,11 +196,11 @@ __global__ void __launch_bounds__(384, Cfg<BM>::OCC)
     const int nk = kb1 - kb0;
 #pragma unroll
     for (int r = 0; r < C::NACC; ++r) acc[r] = 0.f;
-    const int it0 = it;
-    // Stage i: wait for TMA, dequantise into a, issue 4 wgmma, keep one wgmma group in flight.
-    auto step = [&](int i, uint32_t (&a)[4][4]) {
-      const int s = i % STAGES;
-      mbar_wait(&full[s], (i / STAGES) & 1);
+    int prev = -1;
+    // One stage: wait for TMA, dequantise into a, issue 4 wgmma, keep one wgmma group in flight.
+    auto step = [&](uint32_t (&a)[4][4]) {
+      const int s = cs;
+      mbar_wait(&full[s], cph);
       const uint8_t* st = smem + s * C::STAGE_BYTES;
       const uint32_t sts = smem_u32(st);
       const uint4 q = lds128(sts + C::X_BYTES + (c * 128 + tid) * 16);
@@ -218,23 +220,25 @@ __global__ void __launch_bounds__(384, Cfg<BM>::OCC)
 #pragma unroll
       for (int r = 0; r < C::NACC; ++r) fence_reg(acc[r]);
       wg_wait<1>();
-      if (i > it0) {
+      if (prev >= 0) {
         __syncwarp();
-        if (lane == 0) mbar_arrive(&empty[(i - 1) % STAGES]);
+        if (lane == 0) mbar_arrive(&empty[prev]);
       }
+      prev = s;
+      if (++cs == STAGES) { cs = 0; cph ^= 1; }
     };
     uint32_t a0[4][4], a1[4][4];
-    const int it1 = it0 + nk;
-    for (; it + 1 < it1; it += 2) {
-      step(it, a0);
-      step(it + 1, a1);
+    int i = 0;
+    for (; i + 1 < nk; i += 2) {
+      step(a0);
+      step(a1);
     }
-    if (it < it1) { step(it, a0); ++it; }
+    if (i < nk) step(a0);
     wg_wait<0>();
 #pragma unroll
     for (int r = 0; r < C::NACC; ++r) fence_reg(acc[r]);
     __syncwarp();
-    if (lane == 0) mbar_arrive(&empty[(it1 - 1) % STAGES]);
+    if (lane == 0) mbar_arrive(&empty[prev]);
 
     if (nsplit > 1) {
       // Split-K: publish fp32 partial; the last CTA of this tile reduces and stores.
