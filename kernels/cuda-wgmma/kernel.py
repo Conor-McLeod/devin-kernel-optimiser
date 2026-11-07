@@ -96,7 +96,7 @@ def _config(M, N, K):
 
 
 _OVERRIDE = os.environ.get("CUDA_WGMMA_CFG")  # "bm,split" for config sweeps
-_PERSIST = os.environ.get("CUDA_WGMMA_PERSIST", "1") != "0"
+_PERSIST = os.environ.get("CUDA_WGMMA_PERSIST", "0") != "0"  # ncu A/B: no net gain
 
 
 def matmul(x, p):
