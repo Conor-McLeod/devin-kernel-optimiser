@@ -82,13 +82,17 @@ def _pick_oneshot(M, N, K):
     if _cfgs is None:
         _cfgs = {tuple(c) for c in ext.configs()}
     MB = 1 if M <= 8 else 2
+    env = os.environ.get("DECODE_CFG")
+    if env:
+        T, U, WC, S = (int(v) for v in env.split(","))
+        return T, U, MB, WC, S
     NT, KB = N // 16, K // 64
     best = None
     for (T, U, mb, WC, S) in _cfgs:
         if mb != MB or T != 1 or S * WC * U < KB:
             continue
         cover = S * WC * U
-        score = ((cover - KB) >= WC * U, S, -min(NT * S, 264), abs(U - 4), cover - KB, -WC)
+        score = ((cover - KB) >= U, U > 2, S, -WC, U)
         if best is None or score < best[0]:
             best = (score, (T, U, MB, WC, S))
     return best[1]
