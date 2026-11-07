@@ -98,6 +98,7 @@ def _config(M, N, K):
     return min(cands, key=lambda c: _est_us(M, N, K, *c))
 
 
+_MIN_PER = 4
 _OVERRIDE = os.environ.get("SCOUT_CFG")  # "bm,split[,persist]" for config sweeps
 
 
@@ -109,4 +110,6 @@ def matmul(x, p):
     else:
         bm, split = _config(M, p["N"], K)
         persist = int(split == 1 and bm >= 64 and M >= 512)
+        if persist:
+            split = _MIN_PER  # stream-K: minimum k-blocks per CTA
     return _ext.w4a16_mm(x, p["wq"], p["s"], _counter_buf(x.device), p["N"], bm, split, persist)
