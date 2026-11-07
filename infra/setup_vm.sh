@@ -16,7 +16,7 @@ echo "== GPU / CUDA toolkit"
 nvidia-smi
 if ! command -v nvcc >/dev/null; then
   echo "!! nvcc not found. Marlin (JIT) and CUDA-C++ agents need the CUDA toolkit (12.4+)."
-  echo "!! Use the ubuntu24.04-cuda12 Nebius image (infra/terraform does), or install cuda-toolkit-12-8, then re-run."
+  echo "!! Use the ubuntu24.04-cuda13.0 Nebius image (infra/terraform does): torch from sglang is built for CUDA 13."
   exit 1
 fi
 nvcc --version | tail -1
@@ -38,7 +38,8 @@ uv venv --python 3.12 "$H/venv"
 uv pip install --python "$H/venv/bin/python" sglang
 uv pip install --python "$H/venv/bin/python" fastapi uvicorn numpy ninja huggingface_hub \
   tilelang nvidia-cutlass-dsl
-"$H/venv/bin/python" -c "import torch, triton; print('torch', torch.__version__, 'triton', triton.__version__, torch.cuda.get_device_name())"
+"$H/venv/bin/python" -c "import torch, triton; print('torch', torch.__version__, 'cuda', torch.version.cuda, 'triton', triton.__version__, torch.cuda.get_device_name())" \
+  || { echo "!! torch can't use the GPU. If it says 'driver too old', the image's driver is older than torch's CUDA ($("$H/venv/bin/python" -c 'import torch; print(torch.version.cuda)')): use a newer image."; exit 1; }
 
 echo "== vLLM venv (Machete baseline only)"
 uv venv --python 3.12 "$H/venv-vllm"

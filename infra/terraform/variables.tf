@@ -20,11 +20,12 @@ variable "preset" {
 }
 
 variable "image_family" {
-  # cuda12 (toolkit 12.8), not the recommended cuda13.0: torch wheels are built for CUDA 12.x
-  # and torch's extension builder refuses an nvcc with a different major version, which
-  # would break Marlin's JIT build and the CUDA C++ agents.
+  # Must match the CUDA major version torch is built for. sglang (0.5.23) installs
+  # torch 2.14 +cu130, which needs driver 580 (the cuda12 image ships 570 and fails with
+  # "NVIDIA driver too old"). This image also has nvcc 13.0, so torch's extension
+  # builder (Marlin JIT, CUDA C++ agents) gets a matching compiler.
   type    = string
-  default = "ubuntu24.04-cuda12"
+  default = "ubuntu24.04-cuda13.0"
 }
 
 variable "disk_gib" {
