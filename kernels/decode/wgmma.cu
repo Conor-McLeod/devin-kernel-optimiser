@@ -93,8 +93,7 @@ template <int BM>
 struct Cfg {
   static constexpr int X_BYTES = BM * BK * 2;
   static constexpr int STAGE_BYTES = ((X_BYTES + W_BYTES + S_BYTES + 1023) / 1024) * 1024;
-  static constexpr int EPI_STRIDE = BN + 8;
-  static constexpr int EPI_BYTES = ((BM * EPI_STRIDE * 2 + 1023) / 1024) * 1024;
+  static constexpr int EPI_BYTES = 2 * BM * 128;  // per consumer WG: [BM][64] bf16, 128B-swizzled for TMA store
   static constexpr int STAGES_RAW = (225 * 1024 - EPI_BYTES) / STAGE_BYTES;
   static constexpr int STAGES = STAGES_RAW > 8 ? 8 : STAGES_RAW;
   static constexpr int PIPE_BYTES = STAGES * STAGE_BYTES;
@@ -108,7 +107,7 @@ struct Cfg {
 // the epilogue has its own smem so the next item's loads overlap it.
 template <int BM>
 __global__ void __launch_bounds__(384, 1)
-    w4a16_kernel(const __grid_constant__ CUtensorMap tmx, const uint8_t* __restrict__ wq,
+    w4a16_kernel(const __grid_constant__ CUtensorMap tmx, const __grid_constant__ CUtensorMap tmy, const uint8_t* __restrict__ wq,
                  const __nv_bfloat16* __restrict__ ws, __nv_bfloat16* __restrict__ y, float* __restrict__ part,
                  int* __restrict__ counters, int M, int N, int K, int kb_per_split, int ntn, int D, int S,
                  int nitems) {
@@ -257,29 +256,51 @@ __global__ void __launch_bounds__(384, 1)
       }
     }
 
-    // Epilogue (per warpgroup, own 64 columns of the [m][n] smem tile), then 16B coalesced stores.
+    // Epilogue (per warpgroup): stmatrix.trans into a swizzled [m][64n] tile, then one TMA store.
+    uint8_t* epi_c = reinterpret_cast<uint8_t*>(epi) + c * BM * 128;
+    if (tid == 0) asm volatile("cp.async.bulk.wait_group.read 0;" ::: "memory");
     asm volatile("bar.sync %0, 128;" ::"r"(2 + c) : "memory");
-    const int nl = c * 64 + warp * 16 + g;
+    {
+      const int jj = lane >> 3, r = lane & 7;
+      const int nch = warp * 2 + (jj & 1);
 #pragma unroll
-    for (int i = 0; i < BM / 8; ++i) {
-      const int m = 8 * i + 2 * t;
-      epi[m * C::EPI_STRIDE + nl] = __float2bfloat16_rn(acc[4 * i]);
-      epi[(m + 1) * C::EPI_STRIDE + nl] = __float2bfloat16_rn(acc[4 * i + 1]);
-      epi[m * C::EPI_STRIDE + nl + 8] = __float2bfloat16_rn(acc[4 * i + 2]);
-      epi[(m + 1) * C::EPI_STRIDE + nl + 8] = __float2bfloat16_rn(acc[4 * i + 3]);
-    }
-    asm volatile("bar.sync %0, 128;" ::"r"(2 + c) : "memory");
-    const int n0 = tile_n * BN + c * 64;
-#pragma unroll 4
-    for (int idx = tid; idx < BM * 8; idx += 128) {
-      const int m = idx / 8, ch = idx % 8;
-      const int gm = tile_m * BM + m, gn = n0 + ch * 8;
-      if (gm < M && gn < N) {
-        const uint4 v = *reinterpret_cast<const uint4*>(epi + m * C::EPI_STRIDE + c * 64 + ch * 8);
-        *reinterpret_cast<uint4*>(y + static_cast<size_t>(gm) * N + gn) = v;
+      for (int i = 0; i < BM / 8; i += 2) {
+        const int m = 8 * (i + (jj >> 1)) + r;
+        const uint32_t addr = smem_u32(epi_c + m * 128 + ((nch ^ (m & 7)) << 4));
+        __nv_bfloat162 p0 = __floats2bfloat162_rn(acc[4 * i], acc[4 * i + 1]);
+        __nv_bfloat162 p1 = __floats2bfloat162_rn(acc[4 * i + 2], acc[4 * i + 3]);
+        __nv_bfloat162 p2 = __floats2bfloat162_rn(acc[4 * i + 4], acc[4 * i + 5]);
+        __nv_bfloat162 p3 = __floats2bfloat162_rn(acc[4 * i + 6], acc[4 * i + 7]);
+        asm volatile("stmatrix.sync.aligned.m8n8.x4.trans.shared.b16 [%0], {%1, %2, %3, %4};" ::"r"(addr),
+                     "r"(*reinterpret_cast<uint32_t*>(&p0)), "r"(*reinterpret_cast<uint32_t*>(&p1)),
+                     "r"(*reinterpret_cast<uint32_t*>(&p2)), "r"(*reinterpret_cast<uint32_t*>(&p3))
+                     : "memory");
       }
     }
+    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+    asm volatile("bar.sync %0, 128;" ::"r"(2 + c) : "memory");
+    const int ny = tile_n * BN + c * 64;
+    if (tid == 0 && ny < N) {
+      asm volatile("cp.async.bulk.tensor.2d.global.shared::cta.bulk_group [%0, {%2, %3}], [%1];" ::"l"(&tmy),
+                   "r"(smem_u32(epi_c)), "r"(ny), "r"(tile_m * BM)
+                   : "memory");
+      asm volatile("cp.async.bulk.commit_group;" ::: "memory");
+    }
   }
+  if (tid == 0) asm volatile("cp.async.bulk.wait_group 0;" ::: "memory");
+}
+
+CUtensorMap make_y_map(void* ptr, int M, int N, int box_m) {
+  CUtensorMap map;
+  cuuint64_t dims[2] = {static_cast<cuuint64_t>(N), static_cast<cuuint64_t>(M)};
+  cuuint64_t strides[1] = {static_cast<cuuint64_t>(N) * 2};
+  cuuint32_t box[2] = {64, static_cast<cuuint32_t>(box_m)};
+  cuuint32_t estr[2] = {1, 1};
+  CUresult r = cuTensorMapEncodeTiled(&map, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 2, ptr, dims, strides, box, estr,
+                                      CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B,
+                                      CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+  TORCH_CHECK(r == CUDA_SUCCESS, "cuTensorMapEncodeTiled(y) failed: ", static_cast<int>(r));
+  return map;
 }
 
 CUtensorMap make_x_map(const void* ptr, int M, int K, int box_m) {
@@ -321,10 +342,11 @@ void launch(const torch::Tensor& x, const torch::Tensor& wq, const torch::Tensor
     part_ptr = part.data_ptr<float>();
   }
   CUtensorMap map = make_x_map(x.data_ptr(), M, K, BM);
+  CUtensorMap ymap = make_y_map(y.data_ptr(), M, N, BM);
   const int nitems = D + R * S;
   dim3 grid(ctas > 0 ? std::min(ctas, nitems) : nitems);
   w4a16_kernel<BM><<<grid, 384, C::SMEM, stream>>>(
-      map, wq.data_ptr<uint8_t>(), reinterpret_cast<const __nv_bfloat16*>(ws.data_ptr()),
+      map, ymap, wq.data_ptr<uint8_t>(), reinterpret_cast<const __nv_bfloat16*>(ws.data_ptr()),
       reinterpret_cast<__nv_bfloat16*>(y.data_ptr()), part_ptr, counters.data_ptr<int>(), M, N, K, kbps, ntn, D, S, nitems);
 }
 
