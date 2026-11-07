@@ -1,0 +1,13 @@
+{
+  "_note": "PLACEHOLDER shapes. Regenerate from the target model with: uv run python -m harness.gen_shapes <hf-repo-or-config.json>",
+  "format": "int4_g128",
+  "ms": [1, 4, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096],
+  "shapes": [
+    {"name": "attn_qkv",   "N": 6144,  "K": 4096},
+    {"name": "attn_o",     "N": 4096,  "K": 4096},
+    {"name": "mlp_gate_up","N": 28672, "K": 4096},
+    {"name": "mlp_down",   "N": 4096,  "K": 14336},
+    {"name": "expert_up",  "N": 1024,  "K": 2048},
+    {"name": "expert_down","N": 2048,  "K": 512}
+  ]
+}

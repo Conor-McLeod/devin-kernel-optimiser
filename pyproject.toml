@@ -1,0 +1,24 @@
+[project]
+name = "devin-kernel-optimiser"
+version = "0.1.0"
+description = "Parallel Devin agents writing Hopper-native W4A16 GEMM kernels to beat Marlin"
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.6",
+    "numpy",
+    "fastapi>=0.110",
+    "uvicorn>=0.29",
+]
+
+[project.optional-dependencies]
+# Kernel DSLs. Linux + CUDA only; installed on the H100 VM by infra/setup_vm.sh.
+dsl = [
+    "triton; sys_platform == 'linux'",
+    "tilelang; sys_platform == 'linux'",
+    "nvidia-cutlass-dsl; sys_platform == 'linux'",
+    "ninja; sys_platform == 'linux'",
+]
+shapes = ["huggingface_hub"]
+
+[tool.uv]
+package = false

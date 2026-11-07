@@ -1,0 +1,129 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Kernel Board</title>
+<style>
+  :root {
+    --bg: #0e1013; --panel: #161a1f; --line: #262c34; --text: #e6e8eb; --muted: #8b939e;
+    --accent: #7cc4ff; --good: #5fd38d; --bad: #ff7a7a; --warn: #f2c14e;
+    --mono: ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.45 system-ui, -apple-system, sans-serif; }
+  header { padding: 18px 24px; border-bottom: 1px solid var(--line); display: flex; align-items: baseline; gap: 16px; flex-wrap: wrap; }
+  header h1 { margin: 0; font-size: 18px; letter-spacing: .02em; }
+  header .sub { color: var(--muted); }
+  main { display: grid; grid-template-columns: minmax(0, 1.6fr) minmax(320px, 1fr); gap: 16px; padding: 16px 24px; }
+  @media (max-width: 1000px) { main { grid-template-columns: 1fr; padding: 16px; } }
+  section { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; min-width: 0; }
+  h2 { margin: 0 0 10px; font-size: 13px; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); }
+  table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+  th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+  th { color: var(--muted); font-weight: 500; font-size: 12px; }
+  td.num, th.num { text-align: right; font-family: var(--mono); }
+  tr.baseline td { color: var(--muted); }
+  .good { color: var(--good); } .bad { color: var(--bad); } .muted { color: var(--muted); }
+  .swatch { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 6px; vertical-align: -1px; }
+  .tablewrap { overflow-x: auto; }
+  #chart { width: 100%; height: 300px; display: block; }
+  .feed { max-height: calc(100vh - 140px); overflow-y: auto; display: flex; flex-direction: column; gap: 8px; }
+  .post { border-left: 3px solid var(--line); padding: 4px 10px; }
+  .post .meta { font-size: 12px; color: var(--muted); }
+  .post .text { white-space: pre-wrap; word-break: break-word; }
+  .kind { font-family: var(--mono); font-size: 11px; padding: 1px 6px; border-radius: 4px; background: var(--line); }
+  .k-claim { border-color: var(--warn); } .k-finding { border-color: var(--accent); }
+  .k-result { border-color: var(--good); } .k-question { border-color: var(--bad); }
+  .stack { display: flex; flex-direction: column; gap: 16px; min-width: 0; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Kernel Board</h1>
+  <span class="sub">W4A16 GEMM on H100 · speedup vs <b id="baseline">…</b> · higher is better</span>
+  <span class="sub" id="updated"></span>
+</header>
+<main>
+  <div class="stack">
+    <section>
+      <h2>Leaderboard</h2>
+      <div class="tablewrap"><table id="lb"><thead><tr>
+        <th>Submission</th><th>DSL</th><th class="num">Geomean</th><th class="num">Decode</th><th class="num">Mid</th><th class="num">Prefill</th><th class="num">Wins</th><th>Last note</th>
+      </tr></thead><tbody></tbody></table></div>
+    </section>
+    <section>
+      <h2>Speedup vs M</h2>
+      <svg id="chart" role="img" aria-label="speedup versus batch size per submission"></svg>
+    </section>
+  </div>
+  <section>
+    <h2>Message board</h2>
+    <div class="feed" id="feed"></div>
+  </section>
+</main>
+<script>
+const COLORS = ["#7cc4ff", "#5fd38d", "#f2c14e", "#ff7a7a", "#c792ea", "#ffa94d", "#4dd0c8", "#e6e8eb"];
+const fmtX = v => v == null ? "–" : v.toFixed(2) + "×";
+const cls = v => v == null ? "muted" : v >= 1 ? "good" : "bad";
+const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+let lastPost = 0;
+
+function drawChart(entries) {
+  const svg = document.getElementById("chart");
+  const W = svg.clientWidth || 600, H = 300, L = 44, R = 22, T = 12, B = 28;
+  const series = entries.filter(e => !e.is_baseline && e.curve.some(p => p[1] != null));
+  const pts = series.flatMap(e => e.curve.filter(p => p[1] != null));
+  if (!pts.length) { svg.innerHTML = `<text x="${W/2}" y="${H/2}" fill="#8b939e" text-anchor="middle">no comparable results yet: benchmark the baseline first</text>`; return; }
+  const ms = pts.map(p => p[0]), ys = pts.map(p => p[1]).concat([1]);
+  const x0 = Math.log2(Math.min(...ms)), x1 = Math.log2(Math.max(...ms)) || x0 + 1;
+  const y0 = Math.min(0.5, ...ys) * 0.95, y1 = Math.max(1.5, ...ys) * 1.05;
+  const sx = m => L + (Math.log2(m) - x0) / ((x1 - x0) || 1) * (W - L - R);
+  const sy = v => T + (1 - (v - y0) / (y1 - y0)) * (H - T - B);
+  let g = "";
+  [...new Set(ms)].sort((a, b) => a - b).forEach(m => g += `<text x="${sx(m)}" y="${H - 8}" fill="#8b939e" font-size="11" text-anchor="middle">${m}</text>`);
+  for (let v = Math.ceil(y0 * 4) / 4; v <= y1; v += 0.25) g += `<text x="${L - 6}" y="${sy(v) + 4}" fill="#8b939e" font-size="11" text-anchor="end">${v.toFixed(2)}</text><line x1="${L}" x2="${W - R}" y1="${sy(v)}" y2="${sy(v)}" stroke="#262c34"/>`;
+  g += `<line x1="${L}" x2="${W - R}" y1="${sy(1)}" y2="${sy(1)}" stroke="#8b939e" stroke-dasharray="4 4"/>`;
+  series.forEach((e, i) => {
+    const c = COLORS[i % COLORS.length], p = e.curve.filter(q => q[1] != null);
+    g += `<polyline fill="none" stroke="${c}" stroke-width="2" points="${p.map(q => `${sx(q[0])},${sy(q[1])}`).join(" ")}"/>`;
+    p.forEach(q => g += `<circle cx="${sx(q[0])}" cy="${sy(q[1])}" r="3" fill="${c}"><title>${esc(e.submission)} M=${q[0]}: ${q[1].toFixed(2)}×</title></circle>`);
+  });
+  svg.setAttribute("viewBox", `0 0 ${W} ${H}`);
+  svg.innerHTML = g;
+}
+
+async function refresh() {
+  try {
+    const lb = await (await fetch("/api/leaderboard")).json();
+    document.getElementById("baseline").textContent = lb.baseline;
+    let ci = 0;
+    document.querySelector("#lb tbody").innerHTML = lb.entries.map(e => {
+      const sw = e.is_baseline ? "" : `<span class="swatch" style="background:${COLORS[ci++ % COLORS.length]}"></span>`;
+      const b = k => Object.entries(e.buckets).find(([n]) => n.startsWith(k))?.[1];
+      const bad = e.incorrect ? ` <span class="bad">(${e.incorrect} incorrect)</span>` : "";
+      return `<tr class="${e.is_baseline ? "baseline" : ""}"><td>${sw}${esc(e.submission)}${bad}</td><td>${esc(e.dsl)}</td>
+        <td class="num ${cls(e.geomean)}">${e.is_baseline ? "baseline" : fmtX(e.geomean)}</td>
+        <td class="num ${cls(b("decode"))}">${fmtX(b("decode"))}</td><td class="num ${cls(b("mid"))}">${fmtX(b("mid"))}</td>
+        <td class="num ${cls(b("prefill"))}">${fmtX(b("prefill"))}</td><td class="num">${e.wins}/${e.compared}</td>
+        <td class="muted">${esc(e.note)}</td></tr>`;
+    }).join("");
+    drawChart(lb.entries);
+    const posts = await (await fetch(`/api/posts?since=${lastPost}`)).json();
+    const feed = document.getElementById("feed");
+    for (const p of posts) {
+      lastPost = Math.max(lastPost, p.id);
+      const el = document.createElement("div");
+      el.className = `post k-${p.kind}`;
+      const t = new Date(p.ts * 1000).toLocaleTimeString();
+      el.innerHTML = `<div class="meta">#${p.id} · ${t} · <b>${esc(p.agent)}</b> <span class="kind">${esc(p.kind)}</span>${p.reply_to ? ` · re #${p.reply_to}` : ""}</div><div class="text">${esc(p.text)}</div>`;
+      feed.prepend(el);
+    }
+    document.getElementById("updated").textContent = "updated " + new Date().toLocaleTimeString();
+  } catch (e) { document.getElementById("updated").textContent = "board unreachable"; }
+}
+refresh(); setInterval(refresh, 3000);
+window.addEventListener("resize", refresh);
+</script>
+</body>
+</html>
