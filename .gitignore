@@ -6,3 +6,8 @@ __pycache__/
 *.nsys-rep
 infra/.env
 infra/launched.json
+
+# terraform
+infra/terraform/.terraform/
+infra/terraform/*.tfstate*
+infra/terraform/terraform.tfvars

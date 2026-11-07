@@ -1,0 +1,26 @@
+#cloud-config
+# Bootstraps the bare minimum. The heavy install (venvs, sglang, Devin CLI) is
+# infra/setup_vm.sh, run by hand after you copy infra/.env over, so no secrets
+# ever go into cloud-init user data.
+users:
+  - name: ${username}
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    shell: /bin/bash
+    ssh_authorized_keys:
+      - ${ssh_public_key}
+
+package_update: true
+packages: [git, tmux, jq, build-essential, curl]
+
+write_files:
+  - path: /etc/profile.d/cuda-path.sh
+    content: |
+      # make nvcc visible to login shells and Devin workers
+      [ -d /usr/local/cuda/bin ] && export PATH=/usr/local/cuda/bin:$PATH
+
+runcmd:
+  - mkdir -p /opt/hackathon/shared /opt/hackathon/workers
+  - chown -R ${username}:${username} /opt/hackathon
+%{ if repo_url != "" ~}
+  - sudo -u ${username} git clone ${repo_url} /opt/hackathon/main
+%{ endif ~}

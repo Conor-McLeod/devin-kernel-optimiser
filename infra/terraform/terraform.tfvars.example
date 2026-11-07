@@ -1,0 +1,5 @@
+project_id  = "project-..."   # nebius iam v2 project list --parent-id <tenant_id>
+subnet_name = "default-subnet-..."  # nebius vpc subnet list
+# preset            = "8gpu-128vcpu-1600gb"
+# ssh_public_key_path = "~/.ssh/id_ed25519.pub"
+# repo_url          = "https://github.com/<you>/devin-kernel-optimiser.git"

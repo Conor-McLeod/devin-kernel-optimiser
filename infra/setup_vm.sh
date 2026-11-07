@@ -12,10 +12,11 @@ sudo apt-get update -y
 sudo apt-get install -y git build-essential tmux curl jq ffmpeg
 
 echo "== GPU / CUDA toolkit"
+[[ -d /usr/local/cuda/bin ]] && export PATH=/usr/local/cuda/bin:$PATH
 nvidia-smi
 if ! command -v nvcc >/dev/null; then
   echo "!! nvcc not found. Marlin (JIT) and CUDA-C++ agents need the CUDA toolkit (12.4+)."
-  echo "!! Install it (e.g. apt install cuda-toolkit-12-8) or use a Nebius image that ships it, then re-run."
+  echo "!! Use the ubuntu24.04-cuda12 Nebius image (infra/terraform does), or install cuda-toolkit-12-8, then re-run."
   exit 1
 fi
 nvcc --version | tail -1
