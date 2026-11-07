@@ -108,7 +108,7 @@ template <int BM, bool PERSIST>
 __global__ void __launch_bounds__(384, 1)
     w4a16_kernel(const __grid_constant__ CUtensorMap tmx, const uint8_t* __restrict__ wq,
                  const __nv_bfloat16* __restrict__ ws, __nv_bfloat16* __restrict__ y, float* __restrict__ part,
-                 int* __restrict__ counters, int M, int N, int K, int kb_per_split, int dp_tiles) {
+                 int* __restrict__ counters, int M, int N, int K, int kb_per_split) {
   using C = Cfg<BM, PERSIST>;
   constexpr int STAGES = C::STAGES;
   extern __shared__ uint8_t smem_raw[];
@@ -117,48 +117,15 @@ __global__ void __launch_bounds__(384, 1)
   uint64_t* empty = full + STAGES;
   int* flag = reinterpret_cast<int*>(empty + STAGES);
 
-  // PERSIST = hybrid data-parallel + stream-K. Tiles [0, dp_tiles) are whole tiles strided over CTAs;
-  // the remaining (tile, k-block) units are split evenly, CTA b owning [sk0 + b*per, sk0 + (b+1)*per).
-  // Tiles split across CTAs are reduced by the last arriving CTA (fp32 partials in `part`).
   const int split = PERSIST ? 0 : blockIdx.z, nsplit = PERSIST ? 1 : gridDim.z;
   const int ntn = (N + BN - 1) / BN;
+  const int ntiles = PERSIST ? ntn * ((M + BM - 1) / BM) : 1;
+  const int t0 = PERSIST ? blockIdx.x : 0, tstep = PERSIST ? gridDim.x : 1;
   const int KB = K / BK, G = K / 128;
-  const int kb0 = PERSIST ? 0 : split * kb_per_split;
-  const int kb1 = PERSIST ? KB : min(KB, kb0 + kb_per_split);
+  const int kb0 = split * kb_per_split;
+  const int kb1 = min(KB, kb0 + kb_per_split);
   const int nk = kb1 - kb0;
-  const int per = kb_per_split;
-  const int work = PERSIST ? ntn * ((M + BM - 1) / BM) * KB : nk;
-  const int sk0 = dp_tiles * KB;
-  const int ndp = PERSIST ? max(0, (dp_tiles - static_cast<int>(blockIdx.x) + static_cast<int>(gridDim.x) - 1) /
-                                       static_cast<int>(gridDim.x))
-                          : 0;
-  const int sk_b = min(work, sk0 + static_cast<int>(blockIdx.x) * per);
-  const int sk_e = min(work, sk_b + per);
-  const int beg = 0;
-  const int end = PERSIST ? ndp * KB + (sk_e - sk_b) : nk;
   const int wg = threadIdx.x / 128, tid = threadIdx.x % 128;
-  auto segment = [&](int cur, int& tile_n, int& tile_m, int& kbeg, int& kend) {
-    if (PERSIST) {
-      int tile;
-      if (cur < ndp * KB) {
-        tile = blockIdx.x + (cur / KB) * gridDim.x;
-        kbeg = 0;
-        kend = KB;
-      } else {
-        const int real = sk_b + (cur - ndp * KB);
-        tile = real / KB;
-        kbeg = real % KB;
-        kend = min(KB, kbeg + (sk_e - real));
-      }
-      tile_n = tile % ntn;
-      tile_m = tile / ntn;
-    } else {
-      tile_n = blockIdx.x;
-      tile_m = blockIdx.y;
-      kbeg = kb0;
-      kend = kb1;
-    }
-  };
 
   if (threadIdx.x == 0) {
     for (int s = 0; s < STAGES; ++s) {
@@ -173,20 +140,18 @@ __global__ void __launch_bounds__(384, 1)
     asm volatile("setmaxnreg.dec.sync.aligned.u32 40;");
     if (tid == 0) {
       int it = 0;
-      for (int cur = beg; cur < end;) {
-        int tile_n, tile_m, kbeg, kend;
-        segment(cur, tile_n, tile_m, kbeg, kend);
-        cur += kend - kbeg;
-        const uint8_t* wsrc = wq + static_cast<size_t>(tile_n) * KB * W_BYTES;
+      for (int tt = t0; tt < ntiles; tt += tstep) {
+        const int tile_n = PERSIST ? tt % ntn : blockIdx.x, tile_m = PERSIST ? tt / ntn : blockIdx.y;
+        const uint8_t* wsrc = wq + (static_cast<size_t>(tile_n) * KB + kb0) * W_BYTES;
         const __nv_bfloat16* ssrc = ws + static_cast<size_t>(tile_n) * G * BN;
-        for (int kb = kbeg; kb < kend; ++kb, ++it) {
+        for (int i = 0; i < nk; ++i, ++it) {
           const int s = it % STAGES;
           if (it >= STAGES) mbar_wait(&empty[s], ((it / STAGES) - 1) & 1);
           uint8_t* st = smem + s * C::STAGE_BYTES;
           mbar_expect_tx(&full[s], C::X_BYTES + W_BYTES + S_BYTES);
-          tma_load_2d(st, &tmx, &full[s], kb * BK, tile_m * BM);
-          bulk_load(st + C::X_BYTES, wsrc + static_cast<size_t>(kb) * W_BYTES, W_BYTES, &full[s]);
-          bulk_load(st + C::X_BYTES + W_BYTES, ssrc + (kb >> 1) * BN, S_BYTES, &full[s]);
+          tma_load_2d(st, &tmx, &full[s], (kb0 + i) * BK, tile_m * BM);
+          bulk_load(st + C::X_BYTES, wsrc + static_cast<size_t>(i) * W_BYTES, W_BYTES, &full[s]);
+          bulk_load(st + C::X_BYTES + W_BYTES, ssrc + ((kb0 + i) >> 1) * BN, S_BYTES, &full[s]);
         }
       }
     }
@@ -230,42 +195,30 @@ __global__ void __launch_bounds__(384, 1)
     }
   };
   uint32_t a0[4][4], a1[4][4];
-  const int ctid = c * 128 + tid;
-  for (int cur = beg; cur < end;) {
-  int tile_n, tile_m, kbeg, kend;
-  segment(cur, tile_n, tile_m, kbeg, kend);
-  const int nseg = kend - kbeg;
-  cur += nseg;
+  for (int tt = t0; tt < ntiles; tt += tstep) {
+  const int tile_n = PERSIST ? tt % ntn : blockIdx.x, tile_m = PERSIST ? tt / ntn : blockIdx.y;
 #pragma unroll
   for (int r = 0; r < C::NACC; ++r) acc[r] = 0.f;
   int i = 0;
-  for (; i + 1 < nseg; i += 2) {
+  for (; i + 1 < nk; i += 2) {
     step(i, a0);
     step(i + 1, a1);
   }
-  if (i < nseg) step(i, a0);
+  if (i < nk) step(i, a0);
   wg_wait<0>();
 #pragma unroll
   for (int r = 0; r < C::NACC; ++r) fence_reg(acc[r]);
   if (PERSIST) {
     __syncwarp();
-    if (lane == 0) mbar_arrive(&empty[(it + nseg - 1) % STAGES]);
+    if (lane == 0) mbar_arrive(&empty[(it + nk - 1) % STAGES]);
   }
-  it += nseg;
+  it += nk;
 
-  const bool partial = PERSIST ? (nseg < KB) : (nsplit > 1);
-  if (partial) {
-    // Publish fp32 partial; the last CTA to arrive for this tile reduces and stores.
-    const int tile_lin = tile_m * ntn + tile_n;
-    const int tstart = tile_lin * KB - sk0;
-    const int g_first = PERSIST ? tstart / per : 0;
-    const int g_last = PERSIST ? (tstart + KB - 1) / per : nsplit - 1;
-    const int me = PERSIST ? static_cast<int>(blockIdx.x) : split;
-    auto slot = [&](int gq) -> size_t {
-      if (PERSIST) return static_cast<size_t>(gq) * 2 + (gq * per >= tstart ? 0 : 1);
-      return static_cast<size_t>(tile_lin) * nsplit + gq;
-    };
-    float4* mine = reinterpret_cast<float4*>(part + slot(me) * BM * BN);
+  if (nsplit > 1) {
+    // Split-K: publish fp32 partial; the last CTA of this tile reduces and stores.
+    const int tile_lin = tile_m * gridDim.x + tile_n;
+    const int ctid = c * 128 + tid;
+    float4* mine = reinterpret_cast<float4*>(part + (static_cast<size_t>(tile_lin) * nsplit + split) * BM * BN);
 #pragma unroll
     for (int r = 0; r < C::NACC / 4; ++r)
       mine[r * 256 + ctid] = make_float4(acc[4 * r], acc[4 * r + 1], acc[4 * r + 2], acc[4 * r + 3]);
@@ -273,16 +226,17 @@ __global__ void __launch_bounds__(384, 1)
     consumer_sync();
     if (ctid == 0) {
       const int old = atomicAdd(&counters[tile_lin], 1);
-      const int last = (old == g_last - g_first);
+      const int last = (old == nsplit - 1);
       if (last) counters[tile_lin] = 0;
       *flag = last;
     }
     consumer_sync();
-    if (!*flag) continue;
+    if (!*flag) return;
     __threadfence();
-    for (int gq = g_first; gq <= g_last; ++gq) {
-      if (gq == me) continue;
-      const float4* other = reinterpret_cast<const float4*>(part + slot(gq) * BM * BN);
+    for (int sp = 0; sp < nsplit; ++sp) {
+      if (sp == split) continue;
+      const float4* other =
+          reinterpret_cast<const float4*>(part + (static_cast<size_t>(tile_lin) * nsplit + sp) * BM * BN);
 #pragma unroll
       for (int r = 0; r < C::NACC / 4; ++r) {
         const float4 v = __ldcg(&other[r * 256 + ctid]);
@@ -317,6 +271,7 @@ __global__ void __launch_bounds__(384, 1)
     }
   }
   consumer_sync();
+  const int ctid = c * 128 + tid;
   const int n0 = tile_n * BN;
   for (int idx = ctid; idx < BM * 16; idx += 256) {
     const int m = idx / 16, ch = idx % 16;
@@ -354,57 +309,33 @@ int num_sms() {
 
 template <int BM, bool PERSIST>
 void launch(const torch::Tensor& x, const torch::Tensor& wq, const torch::Tensor& ws, torch::Tensor& y,
-            torch::Tensor& counters, int N, int split, bool stream_k, cudaStream_t stream) {
-  // PERSIST: `split` is the minimum number of k-blocks per CTA (stream-K granularity).
+            torch::Tensor& counters, int N, int split, cudaStream_t stream) {
   using C = Cfg<BM, PERSIST>;
   const int M = x.size(0), K = x.size(1);
   const int KB = K / BK;
   const int ntiles = (N + BN - 1) / BN, mtiles = (M + BM - 1) / BM;
+  split = std::max(1, std::min(split, KB));
+  const int kbps = (KB + split - 1) / split;
+  split = (KB + kbps - 1) / kbps;
   static bool attr_set = false;
   if (!attr_set) {
     cudaFuncSetAttribute(w4a16_kernel<BM, PERSIST>, cudaFuncAttributeMaxDynamicSharedMemorySize, C::SMEM);
     attr_set = true;
   }
-  TORCH_CHECK(counters.numel() >= ntiles * mtiles, "counter buffer too small");
   torch::Tensor part;
   float* part_ptr = nullptr;
-  int grid_x, kbps, dp_tiles = 0;
-  if (PERSIST) {
-    const int T = ntiles * mtiles, g = num_sms();
-    const int min_per = std::max(1, split);
-    const int rem = T % g;
-    if (!stream_k || rem == 0 || T < g / 2) {
-      dp_tiles = T;
-      kbps = KB;
-      grid_x = std::min(T, g);
-    } else {
-      dp_tiles = T - rem;
-      const int skw = rem * KB;
-      const int skc = std::min(g, std::max(1, skw / min_per));
-      kbps = (skw + skc - 1) / skc;
-      const int ctas = (skw + kbps - 1) / kbps;
-      grid_x = dp_tiles > 0 ? g : ctas;
-    }
-    if (kbps % KB != 0) {
-      part = torch::empty({static_cast<int64_t>(grid_x) * 2 * BM * BN}, x.options().dtype(torch::kFloat32));
-      part_ptr = part.data_ptr<float>();
-    }
-  } else {
-    split = std::max(1, std::min(split, KB));
-    kbps = (KB + split - 1) / split;
-    split = (KB + kbps - 1) / kbps;
-    grid_x = ntiles;
-    if (split > 1) {
-      part = torch::empty({static_cast<int64_t>(ntiles) * mtiles * split * BM * BN},
-                          x.options().dtype(torch::kFloat32));
-      part_ptr = part.data_ptr<float>();
-    }
+  if (split > 1) {
+    TORCH_CHECK(counters.numel() >= ntiles * mtiles, "counter buffer too small");
+    part = torch::empty({static_cast<int64_t>(ntiles) * mtiles * split * BM * BN},
+                        x.options().dtype(torch::kFloat32));
+    part_ptr = part.data_ptr<float>();
   }
   CUtensorMap map = make_x_map(x.data_ptr(), M, K, BM);
-  dim3 grid = PERSIST ? dim3(grid_x) : dim3(ntiles, mtiles, split);
+  if (PERSIST) split = 1;
+  dim3 grid = PERSIST ? dim3(std::min(ntiles * mtiles, num_sms())) : dim3(ntiles, mtiles, split);
   w4a16_kernel<BM, PERSIST><<<grid, 384, C::SMEM, stream>>>(
       map, wq.data_ptr<uint8_t>(), reinterpret_cast<const __nv_bfloat16*>(ws.data_ptr()),
-      reinterpret_cast<__nv_bfloat16*>(y.data_ptr()), part_ptr, counters.data_ptr<int>(), M, N, K, kbps, dp_tiles);
+      reinterpret_cast<__nv_bfloat16*>(y.data_ptr()), part_ptr, counters.data_ptr<int>(), M, N, K, kbps);
 }
 
 }  // namespace
@@ -415,22 +346,21 @@ torch::Tensor w4a16_mm(torch::Tensor x, torch::Tensor wq, torch::Tensor ws, torc
   const at::cuda::CUDAGuard guard(x.device());
   auto y = torch::empty({x.size(0), N}, x.options());
   cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-  if (persist) {
-    // persist > 0: stream-K, `split` = minimum k-blocks per CTA.
+  if (persist && split == 1) {
     switch (bm) {
-      case 64: launch<64, true>(x, wq, ws, y, counters, N, split, persist > 1, stream); break;
-      case 128: launch<128, true>(x, wq, ws, y, counters, N, split, persist > 1, stream); break;
-      case 256: launch<256, true>(x, wq, ws, y, counters, N, split, persist > 1, stream); break;
+      case 64: launch<64, true>(x, wq, ws, y, counters, N, 1, stream); break;
+      case 128: launch<128, true>(x, wq, ws, y, counters, N, 1, stream); break;
+      case 256: launch<256, true>(x, wq, ws, y, counters, N, 1, stream); break;
       default: TORCH_CHECK(false, "bad bm for persist");
     }
     return y;
   }
   switch (bm) {
-    case 16: launch<16, false>(x, wq, ws, y, counters, N, split, false, stream); break;
-    case 32: launch<32, false>(x, wq, ws, y, counters, N, split, false, stream); break;
-    case 64: launch<64, false>(x, wq, ws, y, counters, N, split, false, stream); break;
-    case 128: launch<128, false>(x, wq, ws, y, counters, N, split, false, stream); break;
-    case 256: launch<256, false>(x, wq, ws, y, counters, N, split, false, stream); break;
+    case 16: launch<16, false>(x, wq, ws, y, counters, N, split, stream); break;
+    case 32: launch<32, false>(x, wq, ws, y, counters, N, split, stream); break;
+    case 64: launch<64, false>(x, wq, ws, y, counters, N, split, stream); break;
+    case 128: launch<128, false>(x, wq, ws, y, counters, N, split, stream); break;
+    case 256: launch<256, false>(x, wq, ws, y, counters, N, split, stream); break;
     default: TORCH_CHECK(false, "bad bm");
   }
   return y;
