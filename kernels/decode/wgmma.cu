@@ -13,6 +13,10 @@
 
 #define DEVI __device__ __forceinline__
 
+#ifndef WG_OCC2
+#define WG_OCC2 1
+#endif
+
 namespace {
 
 constexpr int BN = 128;   // weight rows per CTA (2 consumer warpgroups x 64)
@@ -104,7 +108,7 @@ struct Cfg {
   static constexpr int X_BYTES = BM * BK * 2;
   static constexpr int STAGE_BYTES = ((X_BYTES + W_BYTES + S_BYTES + 1023) / 1024) * 1024;
   static constexpr int EPI_BYTES = 2 * BM * 128;  // per consumer WG: [BM][64] bf16, 128B-swizzled for TMA store
-  static constexpr int OCC = BM <= 64 ? 2 : 1;  // small tiles: 2 CTAs/SM hide each other's latency
+  static constexpr int OCC = (WG_OCC2 && BM <= 64) ? 2 : 1;  // small tiles: 2 CTAs/SM hide each other's latency
   static constexpr int STAGES_RAW = ((OCC == 2 ? 112 : 225) * 1024 - EPI_BYTES) / STAGE_BYTES;
   static constexpr int STAGES_CAP = OCC == 2 ? 4 : 8;
   static constexpr int STAGES = STAGES_RAW > STAGES_CAP ? STAGES_CAP : STAGES_RAW;

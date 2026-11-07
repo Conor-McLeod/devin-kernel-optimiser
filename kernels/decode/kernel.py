@@ -28,11 +28,13 @@ def _ext(name):
         from torch.utils.cpp_extension import load
 
         pol = os.environ.get("DECODE_POLICY", "0")
-        build = _HERE / f"build_{name}_p{pol}"
+        occ = os.environ.get("DECODE_OCC2", "1")
+        tag = f"p{pol}o{occ}" if name == "wgmma" else f"p{pol}"
+        build = _HERE / f"build_{name}_{tag}"
         build.mkdir(exist_ok=True)
         src = {"tma": "tma.cu", "oneshot": "w4a16_decode.cu", "wgmma": "wgmma.cu"}[name]
-        flags = _FLAGS + [f"-DSTREAM_POLICY={pol}", f"-I{_HERE}"]
-        _mods[name] = load(name=f"decode_{name}_p{pol}_ext", sources=[str(_HERE / src)],
+        flags = _FLAGS + [f"-DSTREAM_POLICY={pol}", f"-DWG_OCC2={occ}", f"-I{_HERE}"]
+        _mods[name] = load(name=f"decode_{name}_{tag}_ext", sources=[str(_HERE / src)],
                            extra_cuda_cflags=flags, extra_ldflags=["-lcuda"] if name == "wgmma" else [],
                            build_directory=str(build), verbose=False)
         _nsm = torch.cuda.get_device_properties(0).multi_processor_count
@@ -130,7 +132,7 @@ _bufs = {}
 
 
 def _kb_cost(bm):
-    return max(0.22, 0.09 + 0.0022 * bm)  # us per 128x(bm)x64 block (cuda-wgmma fit)
+    return max(0.15, 0.2 + 0.0016 * bm)  # us per 128x(bm)x64 block, fit to harness sweeps
 
 
 def _sim(M, N, K, bm, D, S):
@@ -150,7 +152,7 @@ def _sim(M, N, K, bm, D, S):
             heapq.heapreplace(h, h[0] + d)
         t = max(h)
     if R > 0 and S > 1:
-        t += 1.0 + R * S * bm * 128 * 8 / 2e6
+        t += 1.0 + R * S * bm * 128 * 8 / 4e6
     return t
 
 
