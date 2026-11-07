@@ -75,7 +75,7 @@ def prepare(qw):
 
 NUM_SMS = 132
 _CANDS = [(16, 1), (16, 2), (16, 4), (32, 1), (32, 2), (32, 4), (64, 1), (64, 2), (64, 4), (64, 8),
-          (128, 1), (128, 2), (128, 4), (256, 1), (256, 2)]
+          (96, 1), (96, 2), (128, 1), (128, 2), (128, 4), (192, 1), (192, 2), (256, 1), (256, 2)]
 
 
 def _est_us(M, N, K, bm, split):
@@ -95,20 +95,10 @@ def _config(M, N, K):
     return min(cands, key=lambda c: _est_us(M, N, K, *c))
 
 
-_OVERRIDE = os.environ.get("CUDA_WGMMA_CFG")  # "bm,ipc" for config sweeps
-
-
-def _launch_cfg(M, N, K):
-    """(bm, iterations-per-CTA). ipc a multiple of K/64 => persistent data-parallel tiles; ipc = kb/split => split-K."""
-    bm, split = _config(M, N, K)
-    kb = K // 64
-    if split > 1:
-        return bm, -(-kb // split)
-    tiles = -(-N // 128) * -(-M // bm)
-    return bm, -(-tiles // NUM_SMS) * kb
+_OVERRIDE = os.environ.get("CUDA_WGMMA_CFG")  # "bm,split" for config sweeps
 
 
 def matmul(x, p):
     M, K = x.shape
-    bm, ipc = (int(v) for v in _OVERRIDE.split(",")) if _OVERRIDE else _launch_cfg(M, p["N"], K)
-    return _ext.w4a16_mm(x, p["wq"], p["s"], _counter_buf(x.device), p["N"], bm, 0, ipc)
+    bm, split = (int(v) for v in _OVERRIDE.split(",")) if _OVERRIDE else _config(M, p["N"], K)
+    return _ext.w4a16_mm(x, p["wq"], p["s"], _counter_buf(x.device), p["N"], bm, split)
