@@ -7,3 +7,5 @@
 Example:
     ncu --profile-from-start off --kernel-name regex:'[Mm]arlin' --section SpeedOfLight --section WarpStateStats \
         -o prof python kernels/scout/prof_marlin.py sglang_marlin 12288x2048x16
+- `recheck.py <name> [run_id]` — finds the commit matching a run's bench code_hash, git-archives it, runs harness.check.
+- `repro.py <kernel_dir> NxKxM ...` — deterministic check_once on specific points, seeds 0-2.
