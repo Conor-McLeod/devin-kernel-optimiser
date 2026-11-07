@@ -66,7 +66,8 @@ def bcast_hi(s):
 
 
 class W4A16Sm90:
-    def __init__(self, num_wg: int, bm: int, bk: int = 64, split: int = 1, stages: int = 0):
+    def __init__(self, num_wg: int, bm: int, bk: int = 64, split: int = 1, stages: int = 0,
+                 persist: bool = False, epi_n: int = 0, grid_n: int = 132):
         self.num_wg = num_wg
         self.split = split  # split-K across a (1,1,split) cluster, reduced through DSMEM
         self.bn = 64 * num_wg  # tile over N (wgmma M side)
@@ -74,6 +75,10 @@ class W4A16Sm90:
         self.bk = bk
         self.kc = bk // 64
         self.stages_req = stages
+        # persistent tile loop (1 CTA/SM): next tile's TMA loads overlap this tile's epilogue
+        self.persist = persist and split == 1 and num_wg == 2 and bm % 64 == 0
+        self.grid_n = grid_n
+        self.epi_n = epi_n
         self.threads = 128 * (num_wg + 1)
         self.acc_dtype = cutlass.Float32
 
@@ -101,6 +106,8 @@ class W4A16Sm90:
         )
         self.epi_tile = sm90_utils.compute_tile_shape_or_override(
             tile_mnk, self.y_dtype, is_cooperative=self.num_wg > 1)
+        if cutlass.const_expr(self.num_wg > 1 and self.epi_n > 0):
+            self.epi_tile = (128, min(self.bm, self.epi_n))
         self.epi_stage = 2
 
         x_bytes = self.bm * self.bk * 2
@@ -147,6 +154,8 @@ class W4A16Sm90:
 
         grid = (cute.ceil_div(cute.size(mY, mode=[0]), self.bn),
                 cute.ceil_div(cute.size(mY, mode=[1]), self.bm), self.split)
+        if cutlass.const_expr(self.persist):
+            grid = (self.grid_n, 1, 1)
         self.kernel(tma_x, tX, tma_w, tW, tma_s, tS, tma_y, tY, self.tiled_mma,
                     x_smem_staged, w_smem_staged, s_smem_staged, epi_smem_staged).launch(
             grid=grid, block=[self.threads, 1, 1], cluster=(1, 1, self.split), stream=stream)
@@ -170,12 +179,10 @@ class W4A16Sm90:
                 A32[base + 2] = dq_pair(q, slo, 2)
                 A32[base + 3] = dq_pair(q, shi, 3)
 
-    def mma(self, tiled_mma, acc, A, tCrB, idx, num_kb, first=False):
+    def mma(self, tiled_mma, acc, A, tCrB, idx, num_kb):
         cute.nvgpu.warpgroup.fence()
         for kb in range(num_kb):
             cute.gemm(tiled_mma, acc, A[(None, None, kb)], tCrB[(None, None, kb, idx)], acc)
-            if first:
-                tiled_mma.set(cute.nvgpu.warpgroup.Field.ACCUMULATE, True)
         cute.nvgpu.warpgroup.commit_group()
 
     @cute.kernel
@@ -210,34 +217,44 @@ class W4A16Sm90:
         sS = storage.sS.get_tensor(s_smem_staged)
         sY = storage.sY.get_tensor(epi_smem_staged.outer, swizzle=epi_smem_staged.inner)
 
-        # global tiles
-        gX = cute.local_tile(mX, (self.bm, self.bk), (bidy, None, 0))  # (bm, bk, kt)
-        gW = cute.local_tile(mW, (4, 128, self.num_wg, self.kc), (0, 0, bidx, None))  # (4,128,nwg,kc,kt)
-        gS = cute.local_tile(mS, (32, self.num_wg, 1), (0, bidx, None))  # (32,nwg,1,G)
-        gY = cute.local_tile(mY, (self.bn, self.bm), (bidx, bidy, 0))
-
-        k_tiles = cute.size(gX, mode=[2]) // self.split
+        nt_n = cute.ceil_div(cute.size(mY, mode=[0]), self.bn)
+        if cutlass.const_expr(self.persist):
+            t_beg = bidx
+            t_end = nt_n * cute.ceil_div(cute.size(mY, mode=[1]), self.bm)
+            t_step = self.grid_n
+        else:
+            t_beg = bidy * nt_n + bidx
+            t_end = t_beg + 1
+            t_step = 1
+        gX0 = cute.local_tile(mX, (self.bm, self.bk), (0, None, 0))
+        k_tiles = cute.size(gX0, mode=[2]) // self.split
         kbeg = bidz * k_tiles
         pipeline_init_wait(cluster_shape_mn=(1, 1))
 
         if warp_idx < 4:
             cute.arch.warpgroup_reg_dealloc(40)
             if warp_idx == 0:
-                tXs, tXg = cute.nvgpu.cpasync.tma_partition(
-                    tma_x, 0, cute.make_layout(1), cute.group_modes(sX, 0, 2), cute.group_modes(gX, 0, 2))
-                tWs, tWg = cute.nvgpu.cpasync.tma_partition(
-                    tma_w, 0, cute.make_layout(1), cute.group_modes(sW, 0, 4), cute.group_modes(gW, 0, 4))
-                tSs, tSg = cute.nvgpu.cpasync.tma_partition(
-                    tma_s, 0, cute.make_layout(1), cute.group_modes(sS, 0, 3), cute.group_modes(gS, 0, 3))
                 pstate = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, self.stages)
-                for kt in cutlass.range(kbeg, kbeg + k_tiles, unroll=1):
-                    mainloop.producer_acquire(pstate)
-                    bar = mainloop.producer_get_barrier(pstate)
-                    cute.copy(tma_x, tXg[(None, kt)], tXs[(None, pstate.index)], tma_bar_ptr=bar)
-                    cute.copy(tma_w, tWg[(None, kt)], tWs[(None, pstate.index)], tma_bar_ptr=bar)
-                    cute.copy(tma_s, tSg[(None, kt * self.bk // 128)], tSs[(None, pstate.index)], tma_bar_ptr=bar)
-                    mainloop.producer_commit(pstate)
-                    pstate.advance()
+                for tile in cutlass.range(t_beg, t_end, t_step, unroll=1):
+                    tn = tile % nt_n
+                    tm = tile // nt_n
+                    gX = cute.local_tile(mX, (self.bm, self.bk), (tm, None, 0))  # (bm, bk, kt)
+                    gW = cute.local_tile(mW, (4, 128, self.num_wg, self.kc), (0, 0, tn, None))
+                    gS = cute.local_tile(mS, (32, self.num_wg, 1), (0, tn, None))  # (32,nwg,1,G)
+                    tXs, tXg = cute.nvgpu.cpasync.tma_partition(
+                        tma_x, 0, cute.make_layout(1), cute.group_modes(sX, 0, 2), cute.group_modes(gX, 0, 2))
+                    tWs, tWg = cute.nvgpu.cpasync.tma_partition(
+                        tma_w, 0, cute.make_layout(1), cute.group_modes(sW, 0, 4), cute.group_modes(gW, 0, 4))
+                    tSs, tSg = cute.nvgpu.cpasync.tma_partition(
+                        tma_s, 0, cute.make_layout(1), cute.group_modes(sS, 0, 3), cute.group_modes(gS, 0, 3))
+                    for kt in cutlass.range(kbeg, kbeg + k_tiles, unroll=1):
+                        mainloop.producer_acquire(pstate)
+                        bar = mainloop.producer_get_barrier(pstate)
+                        cute.copy(tma_x, tXg[(None, kt)], tXs[(None, pstate.index)], tma_bar_ptr=bar)
+                        cute.copy(tma_w, tWg[(None, kt)], tWs[(None, pstate.index)], tma_bar_ptr=bar)
+                        cute.copy(tma_s, tSg[(None, kt * self.bk // 128)], tSs[(None, pstate.index)], tma_bar_ptr=bar)
+                        mainloop.producer_commit(pstate)
+                        pstate.advance()
                 mainloop.producer_tail(pstate)
             if cutlass.const_expr(self.split > 1):
                 cute.arch.cluster_arrive()
@@ -250,11 +267,12 @@ class W4A16Sm90:
             wg = cidx // 128
             t = cidx % 128
             srow = (t // 32) * 8 + (t % 32) // 4
+            nthr = 128 * self.num_wg
 
             thr_mma = tiled_mma.get_slice(cidx)
             tCsB = thr_mma.partition_B(sX)
             tCrB = tiled_mma.make_fragment_B(tCsB)
-            tCgC = thr_mma.partition_C(gY)
+            tCgC = thr_mma.partition_C(cute.local_tile(mY, (self.bn, self.bm), (0, 0, 0)))
             acc = cute.make_rmem_tensor(tCgC.shape, self.acc_dtype)
             a_shape = thr_mma.partition_shape_A((self.bn, self.bk))
             A0 = cute.make_rmem_tensor(a_shape, cutlass.BFloat16)
@@ -263,63 +281,74 @@ class W4A16Sm90:
 
             rstate = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.stages)
             lstate = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.stages)
-            tiled_mma.set(cute.nvgpu.warpgroup.Field.ACCUMULATE, False)
-            # k_tiles (K/64) is always even since K % 128 == 0: unroll by 2 to ping-pong A0/A1.
-            mainloop.consumer_wait(rstate)
-            self.dequant(A0, sS, sW, srow, wg, t, rstate.index)
-            # first tile
-            self.mma(tiled_mma, acc, A0, tCrB, rstate.index, num_kb, first=True)
-            rstate.advance()
-            mainloop.consumer_wait(rstate)
-            self.dequant(A1, sS, sW, srow, wg, t, rstate.index)
-            self.mma(tiled_mma, acc, A1, tCrB, rstate.index, num_kb)
-            for kp in cutlass.range(k_tiles // 2 - 1, unroll=1):
-                cute.nvgpu.warpgroup.wait_group(1)
-                mainloop.consumer_release(lstate)
-                lstate.advance()
-                rstate.advance()
+            tiled_mma.set(cute.nvgpu.warpgroup.Field.ACCUMULATE, True)
+            c_pipeline = pipeline.PipelineTmaStore.create(
+                num_stages=self.epi_stage,
+                producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, nthr))
+            for tile in cutlass.range(t_beg, t_end, t_step, unroll=1):
+                tn = tile % nt_n
+                tm = tile // nt_n
+                gY = cute.local_tile(mY, (self.bn, self.bm), (tn, tm, 0))
+                acc.fill(0.0)
+                # k_tiles is always even (K % 128 == 0): unroll by 2 to ping-pong A0/A1.
                 mainloop.consumer_wait(rstate)
                 self.dequant(A0, sS, sW, srow, wg, t, rstate.index)
                 self.mma(tiled_mma, acc, A0, tCrB, rstate.index, num_kb)
-                cute.nvgpu.warpgroup.wait_group(1)
-                mainloop.consumer_release(lstate)
-                lstate.advance()
                 rstate.advance()
                 mainloop.consumer_wait(rstate)
                 self.dequant(A1, sS, sW, srow, wg, t, rstate.index)
                 self.mma(tiled_mma, acc, A1, tCrB, rstate.index, num_kb)
-            cute.nvgpu.warpgroup.wait_group(0)
-            mainloop.consumer_release(lstate)
-            lstate.advance()
-            mainloop.consumer_release(lstate)
+                for kp in cutlass.range(k_tiles // 2 - 1, unroll=1):
+                    cute.nvgpu.warpgroup.wait_group(1)
+                    mainloop.consumer_release(lstate)
+                    lstate.advance()
+                    rstate.advance()
+                    mainloop.consumer_wait(rstate)
+                    self.dequant(A0, sS, sW, srow, wg, t, rstate.index)
+                    self.mma(tiled_mma, acc, A0, tCrB, rstate.index, num_kb)
+                    cute.nvgpu.warpgroup.wait_group(1)
+                    mainloop.consumer_release(lstate)
+                    lstate.advance()
+                    rstate.advance()
+                    mainloop.consumer_wait(rstate)
+                    self.dequant(A1, sS, sW, srow, wg, t, rstate.index)
+                    self.mma(tiled_mma, acc, A1, tCrB, rstate.index, num_kb)
+                cute.nvgpu.warpgroup.wait_group(0)
+                mainloop.consumer_release(lstate)
+                lstate.advance()
+                mainloop.consumer_release(lstate)
+                lstate.advance()
+                rstate.advance()
 
-            nthr = 128 * self.num_wg
-            if cutlass.const_expr(self.split > 1):
-                nv = cute.size(acc)
-                red_layout = cute.make_layout((4, nthr, nv // 4), stride=(1, 4, 4 * nthr))
-                sRed = storage.sRed.get_tensor(red_layout)
-                # peers push their fp32 partials into rank 0's smem (fire-and-forget remote stores)
-                if bidz > 0:
-                    rbase = Int32(cute.arch.map_dsmem_ptr(sRed.iterator, 0).toint()) + cidx * 16 + (bidz - 1) * (nv * nthr * 4)
-                    for j in cutlass.range_constexpr(nv // 4):
-                        st_dsmem_v4f32(rbase + 16 * nthr * j, acc[4 * j], acc[4 * j + 1], acc[4 * j + 2], acc[4 * j + 3])
-                cute.arch.cluster_arrive()
-                cute.arch.cluster_wait()
-                if bidz == 0:
-                    for peer in cutlass.range_constexpr(self.split - 1):
-                        part = cute.make_tensor(sRed.iterator + peer * nv * nthr, red_layout)
+                if cutlass.const_expr(self.split > 1):
+                    nv = cute.size(acc)
+                    red_layout = cute.make_layout((4, nthr, nv // 4), stride=(1, 4, 4 * nthr))
+                    sRed = storage.sRed.get_tensor(red_layout)
+                    # peers push their fp32 partials into rank 0's smem (fire-and-forget remote stores)
+                    if bidz > 0:
+                        rbase = Int32(cute.arch.map_dsmem_ptr(sRed.iterator, 0).toint()) + cidx * 16 + (bidz - 1) * (nv * nthr * 4)
                         for j in cutlass.range_constexpr(nv // 4):
-                            for i in cutlass.range_constexpr(4):
-                                acc[4 * j + i] = acc[4 * j + i] + part[i, cidx, j]
-                    self.epilogue(tiled_mma, acc, sY, gY, tma_y, mY, cidx, warp_idx, nthr)
-                cute.arch.cluster_arrive()
-                cute.arch.cluster_wait()
-            else:
-                self.epilogue(tiled_mma, acc, sY, gY, tma_y, mY, cidx, warp_idx, nthr)
+                            st_dsmem_v4f32(rbase + 16 * nthr * j, acc[4 * j], acc[4 * j + 1], acc[4 * j + 2], acc[4 * j + 3])
+                    cute.arch.cluster_arrive()
+                    cute.arch.cluster_wait()
+                    if bidz == 0:
+                        for peer in cutlass.range_constexpr(self.split - 1):
+                            part = cute.make_tensor(sRed.iterator + peer * nv * nthr, red_layout)
+                            for j in cutlass.range_constexpr(nv // 4):
+                                for i in cutlass.range_constexpr(4):
+                                    acc[4 * j + i] = acc[4 * j + i] + part[i, cidx, j]
+                        self.epilogue(tiled_mma, acc, sY, gY, tma_y, mY, cidx, warp_idx, nthr, c_pipeline)
+                    cute.arch.cluster_arrive()
+                    cute.arch.cluster_wait()
+                else:
+                    self.epilogue(tiled_mma, acc, sY, gY, tma_y, mY, cidx, warp_idx, nthr, c_pipeline)
+            if warp_idx == 4:
+                c_pipeline.producer_tail()
 
     @cute.jit
     def epilogue(self, tiled_mma: cute.TiledMma, acc: cute.Tensor, sY: cute.Tensor, gY: cute.Tensor,
-                 tma_y: cute.CopyAtom, mY: cute.Tensor, cidx: Int32, warp_idx: Int32, nthr: cutlass.Constexpr):
+                 tma_y: cute.CopyAtom, mY: cute.Tensor, cidx: Int32, warp_idx: Int32, nthr: cutlass.Constexpr,
+                 c_pipeline):
         # ---------------- epilogue: acc -> bf16 -> smem (stmatrix) -> TMA store
         copy_atom_r2s = sm90_utils.sm90_get_smem_store_op(
             self.y_layout, elem_ty_d=self.y_dtype, elem_ty_acc=self.acc_dtype)
@@ -341,9 +370,6 @@ class W4A16Sm90:
         epi_tile_num = cute.size(gY_epi, mode=[1])
         epi_tile_shape = gY_epi.shape[1]
         epi_tile_layout = cute.make_layout(epi_tile_shape, stride=(epi_tile_shape[1], 1))
-        c_pipeline = pipeline.PipelineTmaStore.create(
-            num_stages=self.epi_stage,
-            producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, nthr))
         for epi_idx in cutlass.range_constexpr(epi_tile_num):
             for v in cutlass.range_constexpr(size_tRS_rD):
                 tRS_rD[v] = tRS_rAcc[epi_idx * size_tRS_rD + v]
@@ -359,5 +385,3 @@ class W4A16Sm90:
                 c_pipeline.producer_commit()
                 c_pipeline.producer_acquire()
             cute.arch.barrier(barrier_id=1, number_of_threads=nthr)
-        if warp_idx == 4:
-            c_pipeline.producer_tail()

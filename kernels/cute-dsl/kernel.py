@@ -62,8 +62,8 @@ def _prefill_config(M, N, K, bk):
     c128, c256 = _ctas(N, M, 2, 128), _ctas(N, M, 2, 256)
     if c128 >= 128:
         if -(-c256 // 132) * 1.72 < -(-c128 // 132):
-            return (2, 256, 64, 1, 0)
-        return (2, 128, bk, 1, 0)
+            return (2, 256, 64, 1, 0, True, 64)
+        return (2, 128, bk, 1, 0, False, 64)
     if c128 * 2 >= 128 and (K // bk) % 4 == 0 and K // bk >= 16:
         return (2, 128, bk, 2, 0)
     for nwg, bm in ((1, 128), (1, 64)):
