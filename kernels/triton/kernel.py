@@ -15,6 +15,7 @@ import os
 import torch
 import triton
 import triton.language as tl
+from triton.tools.tensor_descriptor import TensorDescriptor
 
 META = {"name": "triton", "agent": "triton", "dsl": "triton", "format": "int4_g128"}
 
@@ -87,10 +88,11 @@ def _dequant_scaled(q, s, BN: tl.constexpr, BK: tl.constexpr):
 
 @triton.jit(do_not_specialize=["M"])
 def _w4a16_kernel(
-    x_ptr, q_ptr, s_ptr, y_ptr, ws_ptr, cnt_ptr,
+    x_ptr, q_ptr, s_ptr, y_ptr, ws_ptr, cnt_ptr, x_desc, q_desc,
     M, N, K,
     GROUP: tl.constexpr, BN: tl.constexpr, BM: tl.constexpr, BK: tl.constexpr,
     SPLIT_K: tl.constexpr, GROUP_M: tl.constexpr, SCALE_AFTER: tl.constexpr,
+    TMA: tl.constexpr, NUM_STAGES: tl.constexpr,
 ):
     pid = tl.program_id(0)
     pid_k = tl.program_id(1)
@@ -117,10 +119,14 @@ def _w4a16_kernel(
 
     acc = tl.zeros((BN, BM), dtype=tl.float32)
     q_off = rn[:, None] * 16 + (rkw // 16)[None, :] * (N * 16) + (rkw % 16)[None, :]
-    for it in range(it0, it1):
+    for it in tl.range(it0, it1, num_stages=NUM_STAGES):
         k0 = it * BK
-        q = tl.load(q_ptr + (k0 // 128) * (N * 16) + (k0 % 128) // 8 + q_off)  # [BN, BK/8] int32
-        xt = tl.load(x_ptr + rm_c[None, :] * K + (k0 + rk)[:, None], mask=(rm < M)[None, :], other=0.0)  # [BK, BM]
+        if TMA:
+            q = q_desc.load([k0 // 128, pid_n * BN, (k0 % 128) // 8]).reshape(BN, BK // 8)
+            xt = tl.trans(x_desc.load([pid_m * BM, k0]))
+        else:
+            q = tl.load(q_ptr + (k0 // 128) * (N * 16) + (k0 % 128) // 8 + q_off)  # [BN, BK/8] int32
+            xt = tl.load(x_ptr + rm_c[None, :] * K + (k0 + rk)[:, None], mask=(rm < M)[None, :], other=0.0)  # [BK, BM]
         if SCALE_AFTER:
             wb = _dequant(q, BN, BK)
             s = tl.load(s_ptr + rn * (K // GROUP) + k0 // GROUP).to(tl.float32)  # [BN]
@@ -183,17 +189,12 @@ def _config(M, N, K):
     if M <= 16:
         return 64, 16, 128, -264, 4, 4, 1
     if M <= 256:
-        if cd(N, 64) * cd(M, 32) <= 528:
+        if cd(N, 64) * cd(M, 32) <= 640:
             return 64, 32, 128, -264, 4, 4, 1
         return 128, 64, 128, -264, 8, 4, 0
-    t128 = cd(N, 128) * cd(M, 128)
-    if t128 < 100:
+    if cd(N, 128) * cd(M, 128) < 150:
         return 64, 128, 64, 1, 4, 4, 0
-    if t128 < 300:
-        return 128, 128, 128, 1, 8, 3, 1
-    if t128 < 528:
-        return 128, 128, 128, 1, 8, 3, 0
-    return 128, 128, 64, 1, 8, 4, 0
+    return 128, 128, 128, 1, 8, 2, 0  # BK=128 with 3 stages gives NaNs (pipeliner race)
 
 
 _bufs = {}
@@ -224,9 +225,15 @@ def matmul(x, p):
         cnt = _buf("cnt", tiles, torch.int32, x.device)
     else:
         ws = cnt = y
+    tma = int(os.environ.get("TRITON_W4_TMA", "1"))
+    if tma:
+        xd = TensorDescriptor.from_tensor(x, [bm, bk])
+        qd = TensorDescriptor.from_tensor(p["q"], [1, bn, bk // 8])
+    else:
+        xd = qd = None
     _w4a16_kernel[(tiles, sk)](
-        x, p["q"], p["s"], y, ws, cnt, M, N, K,
-        GROUP=128, BN=bn, BM=bm, BK=bk, SPLIT_K=sk, GROUP_M=8, SCALE_AFTER=sa,
+        x, p["q"], p["s"], y, ws, cnt, xd, qd, M, N, K,
+        GROUP=128, BN=bn, BM=bm, BK=bk, SPLIT_K=sk, GROUP_M=8, SCALE_AFTER=sa, TMA=bool(tma), NUM_STAGES=ns,
         num_warps=nw, num_stages=ns,
     )
     return y
