@@ -122,7 +122,7 @@ def _prepare_wgmma(qw):
     return {"wq": wq, "wsc": sc}
 
 
-_BMS = (16, 32, 64, 128, 256)
+_BMS = (16, 32, 64, 96, 128, 192, 256)
 _SPLITS = (1, 2, 3, 4, 6, 8)
 _sched = {}
 _bufs = {}

@@ -60,6 +60,16 @@ DEVI void fence_reg(float& r) { asm volatile("" : "+f"(r)::"memory"); }
 DEVI void fence_reg(uint32_t& r) { asm volatile("" : "+r"(r)::"memory"); }
 DEVI void consumer_sync() { asm volatile("bar.sync 1, 256;" ::: "memory"); }
 
+DEVI uint4 lds128(uint32_t addr) {
+  uint4 v;
+  asm volatile("ld.shared.v4.u32 {%0, %1, %2, %3}, [%4];" : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w) : "r"(addr));
+  return v;
+}
+DEVI uint32_t lds_bf16x2_bcast(uint32_t addr) {
+  uint16_t h;
+  asm volatile("ld.shared.u16 %0, [%1];" : "=h"(h) : "r"(addr));
+  return static_cast<uint32_t>(h) * 0x10001u;
+}
 DEVI uint64_t make_desc_sw128(uint32_t saddr) {
   uint64_t d = 0;
   d |= static_cast<uint64_t>((saddr & 0x3FFFF) >> 4);
@@ -182,12 +192,10 @@ __global__ void __launch_bounds__(384, 1)
       const int s = i % STAGES;
       mbar_wait(&full[s], (i / STAGES) & 1);
       const uint8_t* st = smem + s * C::STAGE_BYTES;
-      const uint4 q = reinterpret_cast<const uint4*>(st + C::X_BYTES)[c * 128 + tid];
-      const __nv_bfloat16* sc = reinterpret_cast<const __nv_bfloat16*>(st + C::X_BYTES + W_BYTES);
-      const __nv_bfloat162 s0b = __bfloat162bfloat162(sc[row]);
-      const __nv_bfloat162 s1b = __bfloat162bfloat162(sc[row + 8]);
-      const uint32_t s0 = *reinterpret_cast<const uint32_t*>(&s0b);
-      const uint32_t s1 = *reinterpret_cast<const uint32_t*>(&s1b);
+      const uint32_t sts = smem_u32(st);
+      const uint4 q = lds128(sts + C::X_BYTES + (c * 128 + tid) * 16);
+      const uint32_t s0 = lds_bf16x2_bcast(sts + C::X_BYTES + W_BYTES + row * 2);
+      const uint32_t s1 = lds_bf16x2_bcast(sts + C::X_BYTES + W_BYTES + (row + 8) * 2);
       dequant8(q.x, s0, s1, a[0]);
       dequant8(q.y, s0, s1, a[1]);
       dequant8(q.z, s0, s1, a[2]);
@@ -362,7 +370,9 @@ torch::Tensor w4a16_mm(torch::Tensor x, torch::Tensor wq, torch::Tensor ws, torc
     case 16: launch<16>(x, wq, ws, y, counters, part, N, D, S, ctas, stream); break;
     case 32: launch<32>(x, wq, ws, y, counters, part, N, D, S, ctas, stream); break;
     case 64: launch<64>(x, wq, ws, y, counters, part, N, D, S, ctas, stream); break;
+    case 96: launch<96>(x, wq, ws, y, counters, part, N, D, S, ctas, stream); break;
     case 128: launch<128>(x, wq, ws, y, counters, part, N, D, S, ctas, stream); break;
+    case 192: launch<192>(x, wq, ws, y, counters, part, N, D, S, ctas, stream); break;
     case 256: launch<256>(x, wq, ws, y, counters, part, N, D, S, ctas, stream); break;
     default: TORCH_CHECK(false, "bad bm");
   }
