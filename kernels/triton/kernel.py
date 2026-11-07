@@ -166,7 +166,7 @@ def _w4a16_persistent_kernel(
     x_desc, q_desc, y_desc, s_ptr, M, N, K,
     GROUP: tl.constexpr, BN: tl.constexpr, BM: tl.constexpr, BK: tl.constexpr,
     GROUP_M: tl.constexpr, NUM_STAGES: tl.constexpr, NUM_PROGS: tl.constexpr,
-    FLATTEN: tl.constexpr,
+    FLATTEN: tl.constexpr, EPI_SPLIT: tl.constexpr,
 ):
     # persistent data-parallel tiles; flatten=True lets the pipeliner prefetch the next
     # tile's k-blocks while the current tile's epilogue runs
@@ -192,7 +192,13 @@ def _w4a16_persistent_kernel(
             s = tl.load(s_ptr + rn * (K // GROUP) + k0 // GROUP)
             wb = _dequant_scaled(q, tl.broadcast_to(s[:, None], (BN, BK // 8)), BN, BK)
             acc = tl.dot(wb, xt, acc)
-        y_desc.store([m0, n0], tl.trans(acc).to(tl.bfloat16))
+        out = tl.trans(acc).to(tl.bfloat16)
+        if EPI_SPLIT:
+            o0, o1 = tl.split(out.reshape(BM, 2, BN // 2).permute(0, 2, 1))
+            y_desc.store([m0, n0], o0)
+            y_desc.store([m0, n0 + BN // 2], o1)
+        else:
+            y_desc.store([m0, n0], out)
 
 
 def _interleave(codes: torch.Tensor) -> torch.Tensor:
@@ -278,10 +284,12 @@ def matmul(x, p):
         nprog = min(tiles, _num_sms(x.device) * pers)
         xd = TensorDescriptor.from_tensor(x, [bm, bk])
         qd = TensorDescriptor.from_tensor(p["q"], [1, bn, bk // 8])
-        yd = TensorDescriptor.from_tensor(y, [bm, bn])
+        epi = int(os.environ.get("TRITON_W4_EPI", "0"))
+        yd = TensorDescriptor.from_tensor(y, [bm, bn // 2 if epi else bn])
         _w4a16_persistent_kernel[(nprog,)](
             xd, qd, yd, p["s"], M, N, K,
-            GROUP=128, BN=bn, BM=bm, BK=bk, GROUP_M=8, NUM_STAGES=ns, NUM_PROGS=nprog,
+            GROUP=128, BN=bn, BM=bm, BK=bk, GROUP_M=int(os.environ.get("TRITON_W4_GM", "8")), NUM_STAGES=ns, NUM_PROGS=nprog,
+            EPI_SPLIT=bool(epi),
             FLATTEN=bool(int(os.environ.get("TRITON_W4_FLAT", "1"))),
             num_warps=nw, num_stages=ns,
         )
