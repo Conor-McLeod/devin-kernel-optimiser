@@ -122,6 +122,7 @@ def _prepare_wgmma(qw):
     return {"wq": wq, "wsc": sc}
 
 
+_PERSIST = os.environ.get("DECODE_P", "1") == "1"
 _BMS = (16, 32, 64, 96, 128, 192, 256)
 _SPLITS = (1, 2, 3, 4, 6, 8)
 _sched = {}
@@ -203,7 +204,7 @@ def matmul(x, p):
         bm, D, S = _wg_cfg(M, N, K)
         T = -(-N // 128) * -(-M // bm)
         cnt, part = _wg_bufs(x.device, (T - D) * S * bm * 128)
-        ctas = (_nsm or 132) if os.environ.get("DECODE_P", "1") == "1" else 0
+        ctas = (_nsm or 132) if _PERSIST else 0
         return _ext("wgmma").w4a16_mm(x, p["wq"], p["wsc"], cnt, part, N, bm, D, S, ctas)
     y = torch.empty(M, N, dtype=torch.bfloat16, device=x.device)
     impl = _impl()

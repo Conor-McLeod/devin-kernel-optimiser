@@ -104,8 +104,12 @@ struct Cfg {
   static constexpr int X_BYTES = BM * BK * 2;
   static constexpr int STAGE_BYTES = ((X_BYTES + W_BYTES + S_BYTES + 1023) / 1024) * 1024;
   static constexpr int EPI_BYTES = 2 * BM * 128;  // per consumer WG: [BM][64] bf16, 128B-swizzled for TMA store
-  static constexpr int STAGES_RAW = (225 * 1024 - EPI_BYTES) / STAGE_BYTES;
-  static constexpr int STAGES = STAGES_RAW > 8 ? 8 : STAGES_RAW;
+  static constexpr int OCC = BM <= 64 ? 2 : 1;  // small tiles: 2 CTAs/SM hide each other's latency
+  static constexpr int STAGES_RAW = ((OCC == 2 ? 112 : 225) * 1024 - EPI_BYTES) / STAGE_BYTES;
+  static constexpr int STAGES_CAP = OCC == 2 ? 4 : 8;
+  static constexpr int STAGES = STAGES_RAW > STAGES_CAP ? STAGES_CAP : STAGES_RAW;
+  static constexpr int REG_P = OCC == 2 ? 24 : 40;
+  static constexpr int REG_C = OCC == 2 ? 104 : 232;  // 128*24 + 256*104 <= 384*80
   static constexpr int PIPE_BYTES = STAGES * STAGE_BYTES;
   static constexpr int BAR_OFF = PIPE_BYTES + EPI_BYTES;
   static constexpr int SMEM = 1024 + BAR_OFF + 2 * STAGES * 8 + 16;
@@ -116,7 +120,7 @@ struct Cfg {
 // [D, D+R*S) are split-K pieces of the remaining R tiles. The TMA producer runs ahead across items;
 // the epilogue has its own smem so the next item's loads overlap it.
 template <int BM>
-__global__ void __launch_bounds__(384, 1)
+__global__ void __launch_bounds__(384, Cfg<BM>::OCC)
     w4a16_kernel(const __grid_constant__ CUtensorMap tmx, const __grid_constant__ CUtensorMap tmy, const uint8_t* __restrict__ wq,
                  const __nv_bfloat16* __restrict__ ws, __nv_bfloat16* __restrict__ y, float* __restrict__ part,
                  int* __restrict__ counters, int M, int N, int K, int kb_per_split, int ntn, int D, int S,
@@ -151,7 +155,7 @@ __global__ void __launch_bounds__(384, 1)
   __syncthreads();
 
   if (wg == 0) {
-    asm volatile("setmaxnreg.dec.sync.aligned.u32 40;");
+    asm volatile("setmaxnreg.dec.sync.aligned.u32 %0;" ::"n"(C::REG_P));
     if (tid == 0) {
       int it = 0;
       for (int w = blockIdx.x; w < nitems; w += gridDim.x) {
@@ -174,7 +178,7 @@ __global__ void __launch_bounds__(384, 1)
     return;
   }
 
-  asm volatile("setmaxnreg.inc.sync.aligned.u32 232;");
+  asm volatile("setmaxnreg.inc.sync.aligned.u32 %0;" ::"n"(C::REG_C));
   const int c = wg - 1, warp = tid / 32, lane = tid % 32, g = lane / 4, t = lane % 4;
   const int row = c * 64 + warp * 16 + g;
   float acc[C::NACC];
@@ -349,10 +353,24 @@ void launch(const torch::Tensor& x, const torch::Tensor& wq, const torch::Tensor
     TORCH_CHECK(part.numel() >= static_cast<int64_t>(R) * S * BM * BN, "partial buffer too small");
     part_ptr = part.data_ptr<float>();
   }
-  CUtensorMap map = make_x_map(x.data_ptr(), M, K, BM);
-  CUtensorMap ymap = make_y_map(y.data_ptr(), M, N, BM);
+  // Tensor maps only encode address/shape; cache the last one per BM (allocator reuses buffers).
+  static const void* xk[3] = {nullptr, nullptr, nullptr};
+  static const void* yk[3] = {nullptr, nullptr, nullptr};
+  static CUtensorMap map, ymap;
+  if (xk[0] != x.data_ptr() || xk[1] != reinterpret_cast<void*>(static_cast<intptr_t>(M)) ||
+      xk[2] != reinterpret_cast<void*>(static_cast<intptr_t>(K))) {
+    map = make_x_map(x.data_ptr(), M, K, BM);
+    xk[0] = x.data_ptr(); xk[1] = reinterpret_cast<void*>(static_cast<intptr_t>(M));
+    xk[2] = reinterpret_cast<void*>(static_cast<intptr_t>(K));
+  }
+  if (yk[0] != y.data_ptr() || yk[1] != reinterpret_cast<void*>(static_cast<intptr_t>(M)) ||
+      yk[2] != reinterpret_cast<void*>(static_cast<intptr_t>(N))) {
+    ymap = make_y_map(y.data_ptr(), M, N, BM);
+    yk[0] = y.data_ptr(); yk[1] = reinterpret_cast<void*>(static_cast<intptr_t>(M));
+    yk[2] = reinterpret_cast<void*>(static_cast<intptr_t>(N));
+  }
   const int nitems = D + R * S;
-  dim3 grid(ctas > 0 ? std::min(ctas, nitems) : nitems);
+  dim3 grid(ctas > 0 ? std::min(ctas * C::OCC, nitems) : nitems);
   w4a16_kernel<BM><<<grid, 384, C::SMEM, stream>>>(
       map, ymap, wq.data_ptr<uint8_t>(), reinterpret_cast<const __nv_bfloat16*>(ws.data_ptr()),
       reinterpret_cast<__nv_bfloat16*>(y.data_ptr()), part_ptr, counters.data_ptr<int>(), M, N, K, kbps, ntn, D, S, nitems);
