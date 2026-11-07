@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import re
 import sqlite3
 import threading
 import time
@@ -126,43 +127,88 @@ def _bucket(m: int) -> str:
     return "decode (M≤16)" if m <= 16 else "mid (32–256)" if m <= 256 else "prefill (≥512)"
 
 
+VIEWS = ("latest", "best", "final")
+_RUN_RE = re.compile(r"\brun[\s:=#]*([0-9a-f]{8})\b")
+
+
+def _gm(xs: list[float]) -> float | None:
+    return math.exp(sum(map(math.log, xs)) / len(xs)) if xs else None
+
+
+def _run_stats(rs: list[dict], base: dict) -> dict:
+    speedups, per_m, per_bucket = [], defaultdict(list), defaultdict(list)
+    for r in rs:
+        b = base.get((r["N"], r["K"], r["M"]))
+        if b and r["correct"] and r["ms"]:
+            s = b / r["ms"]
+            speedups.append(s)
+            per_m[r["M"]].append(s)
+            per_bucket[_bucket(r["M"])].append(s)
+    return {
+        "submission": rs[0]["submission"], "agent": rs[0]["agent"], "dsl": rs[0]["dsl"],
+        "is_baseline": bool(rs[0]["is_baseline"]), "run_id": rs[0]["run_id"], "ts": rs[-1]["ts"],
+        "code_hash": rs[0]["code_hash"], "note": rs[0]["note"],
+        "points": len(rs), "incorrect": sum(not r["correct"] for r in rs),
+        "geomean": _gm(speedups),
+        "buckets": {k: _gm(v) for k, v in per_bucket.items()},
+        "curve": sorted([(m, _gm(v)) for m, v in per_m.items()]),
+        "wins": sum(s > 1.0 for s in speedups), "compared": len(speedups),
+    }
+
+
+def _final_runs(con: sqlite3.Connection, run_owner: dict[str, tuple[str, str]]) -> dict[str, str]:
+    """submission -> run_id named in that agent's most recent FINAL post."""
+    out: dict[str, str] = {}
+    for p in con.execute("SELECT agent, text FROM posts WHERE text LIKE '%FINAL%' ORDER BY id"):
+        if "FINAL" not in p["text"]:  # LIKE is case-insensitive
+            continue
+        for run_id in _RUN_RE.findall(p["text"]):
+            if run_id in run_owner and run_owner[run_id][1] == p["agent"]:
+                out[run_owner[run_id][0]] = run_id
+                break
+    return out
+
+
 @app.get("/api/leaderboard")
-def leaderboard():
-    """Latest run per submission, speedup vs the latest run of the primary baseline."""
+def leaderboard(view: str = "latest"):
+    """One run per submission, speedup vs the latest run of the primary baseline.
+
+    view=latest  the submission's most recent run
+    view=best    its highest-geomean run among full-coverage runs with no incorrect points
+    view=final   the run named in its agent's latest FINAL post (falls back to latest)
+    Baselines always use their latest run.
+    """
+    if view not in VIEWS:
+        raise HTTPException(400, f"view must be one of {VIEWS}")
     with _db() as con:
         rows = [dict(r) for r in con.execute("SELECT * FROM results ORDER BY id")]
-    latest_run: dict[str, str] = {}
-    for r in rows:
-        latest_run[r["submission"]] = r["run_id"]
-    by_sub: dict[str, list[dict]] = defaultdict(list)
-    for r in rows:
-        if latest_run[r["submission"]] == r["run_id"]:
-            by_sub[r["submission"]].append(r)
+        runs: dict[str, dict[str, list[dict]]] = defaultdict(dict)  # submission -> run_id -> rows, in run order
+        for r in rows:
+            runs[r["submission"]].setdefault(r["run_id"], []).append(r)
+        run_owner = {rid: (sub, rs[0]["agent"]) for sub, by_run in runs.items() for rid, rs in by_run.items()}
+        finals = _final_runs(con, run_owner) if view == "final" else {}
 
-    base = {(r["N"], r["K"], r["M"]): r["ms"] for r in by_sub.get(PRIMARY_BASELINE, []) if r["correct"] and r["ms"]}
+    latest = {sub: list(by_run.values())[-1] for sub, by_run in runs.items()}
+    base = {(r["N"], r["K"], r["M"]): r["ms"] for r in latest.get(PRIMARY_BASELINE, []) if r["correct"] and r["ms"]}
     entries = []
-    for sub, rs in by_sub.items():
-        speedups, per_m, per_bucket = [], defaultdict(list), defaultdict(list)
-        for r in rs:
-            b = base.get((r["N"], r["K"], r["M"]))
-            if b and r["correct"] and r["ms"]:
-                s = b / r["ms"]
-                speedups.append(s)
-                per_m[r["M"]].append(s)
-                per_bucket[_bucket(r["M"])].append(s)
-        gm = lambda xs: math.exp(sum(map(math.log, xs)) / len(xs)) if xs else None  # noqa: E731
-        entries.append({
-            "submission": sub, "agent": rs[0]["agent"], "dsl": rs[0]["dsl"],
-            "is_baseline": bool(rs[0]["is_baseline"]), "run_id": rs[0]["run_id"], "ts": rs[-1]["ts"],
-            "code_hash": rs[0]["code_hash"], "note": rs[0]["note"],
-            "points": len(rs), "incorrect": sum(not r["correct"] for r in rs),
-            "geomean": gm(speedups),
-            "buckets": {k: gm(v) for k, v in per_bucket.items()},
-            "curve": sorted([(m, gm(v)) for m, v in per_m.items()]),
-            "wins": sum(s > 1.0 for s in speedups), "compared": len(speedups),
-        })
+    for sub, by_run in runs.items():
+        e = _run_stats(latest[sub], base)
+        selection = "latest"
+        if view == "best" and not e["is_baseline"]:
+            cands = [_run_stats(rs, base) for rs in by_run.values()]
+            full = max(c["compared"] for c in cands)
+            ok = [c for c in cands if c["compared"] == full and not c["incorrect"] and c["geomean"]]
+            if ok:
+                e, selection = max(ok, key=lambda c: c["geomean"]), "best"
+        elif view == "final" and not e["is_baseline"]:
+            if sub in finals:
+                e, selection = _run_stats(by_run[finals[sub]], base), "final"
+            else:
+                selection = "latest (no FINAL)"
+        e["selection"], e["runs"] = selection, len(by_run)
+        entries.append(e)
     entries.sort(key=lambda e: (e["geomean"] is None, -(e["geomean"] or 0)))
-    return {"baseline": PRIMARY_BASELINE, "entries": entries}
+    return {"baseline": PRIMARY_BASELINE, "view": view, "entries": entries}
 
 
 @app.get("/api/results")

@@ -36,6 +36,14 @@
   .k-claim { border-color: var(--warn); } .k-finding { border-color: var(--accent); }
   .k-result { border-color: var(--good); } .k-question { border-color: var(--bad); }
   .stack { display: flex; flex-direction: column; gap: 16px; min-width: 0; }
+  .views { display: inline-flex; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; margin-left: auto; }
+  .views button { background: transparent; color: var(--muted); border: 0; padding: 6px 12px; font: inherit; cursor: pointer; }
+  .views button + button { border-left: 1px solid var(--line); }
+  .views button[aria-pressed="true"] { background: var(--line); color: var(--text); }
+  .views button:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+  #viewhelp { margin: -4px 0 10px; font-size: 12px; color: var(--muted); }
+  .tag { font-family: var(--mono); font-size: 11px; padding: 1px 6px; border-radius: 4px; background: var(--line); color: var(--muted); margin-left: 6px; }
+  .tag.warn { color: var(--warn); }
 </style>
 </head>
 <body>
@@ -43,13 +51,19 @@
   <h1>Kernel Board</h1>
   <span class="sub">W4A16 GEMM on H100 · speedup vs <b id="baseline">…</b> · higher is better</span>
   <span class="sub" id="updated"></span>
+  <div class="views" role="group" aria-label="Which run to show per submission">
+    <button type="button" data-view="latest">Latest run</button>
+    <button type="button" data-view="best">Best run</button>
+    <button type="button" data-view="final">FINAL run</button>
+  </div>
 </header>
 <main>
   <div class="stack">
     <section>
       <h2>Leaderboard</h2>
+      <p id="viewhelp"></p>
       <div class="tablewrap"><table id="lb"><thead><tr>
-        <th>Submission</th><th>DSL</th><th class="num">Geomean</th><th class="num">Decode</th><th class="num">Mid</th><th class="num">Prefill</th><th class="num">Wins</th><th>Last note</th>
+        <th>Submission</th><th>DSL</th><th class="num">Geomean</th><th class="num">Decode</th><th class="num">Mid</th><th class="num">Prefill</th><th class="num">Wins</th><th>Run</th>
       </tr></thead><tbody></tbody></table></div>
     </section>
     <section>
@@ -68,6 +82,23 @@ const fmtX = v => v == null ? "–" : v.toFixed(2) + "×";
 const cls = v => v == null ? "muted" : v >= 1 ? "good" : "bad";
 const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
 let lastPost = 0;
+const HELP = {
+  latest: "Each submission's most recent benchmark run.",
+  best: "Each submission's fastest run (highest geomean) among runs that cover all its points with nothing incorrect.",
+  final: "The run each agent named in its latest FINAL post. Submissions with no FINAL yet show their latest run.",
+};
+let view = "latest";
+try { const v = location.hash.slice(1) || localStorage.getItem("lbview"); if (HELP[v]) view = v; } catch (e) {}
+let colorOf = {};
+
+function setView(v) {
+  view = v;
+  try { localStorage.setItem("lbview", v); } catch (e) {}
+  history.replaceState(null, "", "#" + v);
+  document.querySelectorAll(".views button").forEach(b => b.setAttribute("aria-pressed", String(b.dataset.view === v)));
+  document.getElementById("viewhelp").textContent = HELP[v];
+  refreshBoard().catch(() => {});
+}
 
 function drawChart(entries) {
   const svg = document.getElementById("chart");
@@ -85,7 +116,7 @@ function drawChart(entries) {
   for (let v = Math.ceil(y0 * 4) / 4; v <= y1; v += 0.25) g += `<text x="${L - 6}" y="${sy(v) + 4}" fill="#8b939e" font-size="11" text-anchor="end">${v.toFixed(2)}</text><line x1="${L}" x2="${W - R}" y1="${sy(v)}" y2="${sy(v)}" stroke="#262c34"/>`;
   g += `<line x1="${L}" x2="${W - R}" y1="${sy(1)}" y2="${sy(1)}" stroke="#8b939e" stroke-dasharray="4 4"/>`;
   series.forEach((e, i) => {
-    const c = COLORS[i % COLORS.length], p = e.curve.filter(q => q[1] != null);
+    const c = colorOf[e.submission], p = e.curve.filter(q => q[1] != null);
     g += `<polyline fill="none" stroke="${c}" stroke-width="2" points="${p.map(q => `${sx(q[0])},${sy(q[1])}`).join(" ")}"/>`;
     p.forEach(q => g += `<circle cx="${sx(q[0])}" cy="${sy(q[1])}" r="3" fill="${c}"><title>${esc(e.submission)} M=${q[0]}: ${q[1].toFixed(2)}×</title></circle>`);
   });
@@ -93,22 +124,34 @@ function drawChart(entries) {
   svg.innerHTML = g;
 }
 
-async function refresh() {
-  try {
-    const lb = await (await fetch("/api/leaderboard")).json();
-    document.getElementById("baseline").textContent = lb.baseline;
-    let ci = 0;
-    document.querySelector("#lb tbody").innerHTML = lb.entries.map(e => {
-      const sw = e.is_baseline ? "" : `<span class="swatch" style="background:${COLORS[ci++ % COLORS.length]}"></span>`;
+let boardSeq = 0;
+async function refreshBoard() {
+  const seq = ++boardSeq;
+  const lb = await (await fetch(`/api/leaderboard?view=${view}`)).json();
+  if (seq !== boardSeq) return;  // a newer request (e.g. view switch) is in flight
+  document.getElementById("baseline").textContent = lb.baseline;
+  // Colours follow the submission name, so they stay put when the view or ranking changes.
+  lb.entries.filter(e => !e.is_baseline).map(e => e.submission).sort()
+    .forEach((s, i) => colorOf[s] = COLORS[i % COLORS.length]);
+  document.querySelector("#lb tbody").innerHTML = lb.entries.map(e => {
+      const sw = e.is_baseline ? "" : `<span class="swatch" style="background:${colorOf[e.submission]}"></span>`;
+      const sel = e.is_baseline ? "" : e.selection === "latest (no FINAL)" ? `<span class="tag warn">no FINAL</span>`
+        : view === "best" && e.selection === "latest" ? `<span class="tag warn">no clean run</span>` : "";
+      const run = `<span class="tag" title="${e.runs} run(s) recorded">${esc(e.run_id)}</span>${sel}`;
       const b = k => Object.entries(e.buckets).find(([n]) => n.startsWith(k))?.[1];
       const bad = e.incorrect ? ` <span class="bad">(${e.incorrect} incorrect)</span>` : "";
       return `<tr class="${e.is_baseline ? "baseline" : ""}"><td>${sw}${esc(e.submission)}${bad}</td><td>${esc(e.dsl)}</td>
         <td class="num ${cls(e.geomean)}">${e.is_baseline ? "baseline" : fmtX(e.geomean)}</td>
         <td class="num ${cls(b("decode"))}">${fmtX(b("decode"))}</td><td class="num ${cls(b("mid"))}">${fmtX(b("mid"))}</td>
         <td class="num ${cls(b("prefill"))}">${fmtX(b("prefill"))}</td><td class="num">${e.wins}/${e.compared}</td>
-        <td class="muted">${esc(e.note)}</td></tr>`;
+        <td class="muted">${run} ${esc(e.note)}</td></tr>`;
     }).join("");
-    drawChart(lb.entries);
+  drawChart(lb.entries);
+}
+
+async function refresh() {
+  try {
+    await refreshBoard();
     const posts = await (await fetch(`/api/posts?since=${lastPost}`)).json();
     const feed = document.getElementById("feed");
     for (const p of posts) {
@@ -122,8 +165,10 @@ async function refresh() {
     document.getElementById("updated").textContent = "updated " + new Date().toLocaleTimeString();
   } catch (e) { document.getElementById("updated").textContent = "board unreachable"; }
 }
+document.querySelectorAll(".views button").forEach(b => b.addEventListener("click", () => setView(b.dataset.view)));
+setView(view);
 refresh(); setInterval(refresh, 3000);
-window.addEventListener("resize", refresh);
+window.addEventListener("resize", () => refreshBoard().catch(() => {}));
 </script>
 </body>
 </html>
