@@ -161,6 +161,40 @@ def _w4a16_kernel(
             tl.atomic_xchg(cnt_ptr + tile, 0, sem="relaxed", scope="gpu")
 
 
+@triton.jit(do_not_specialize=["M"])
+def _w4a16_persistent_kernel(
+    x_desc, q_desc, y_desc, s_ptr, M, N, K,
+    GROUP: tl.constexpr, BN: tl.constexpr, BM: tl.constexpr, BK: tl.constexpr,
+    GROUP_M: tl.constexpr, NUM_STAGES: tl.constexpr, NUM_PROGS: tl.constexpr,
+    FLATTEN: tl.constexpr,
+):
+    # persistent data-parallel tiles; flatten=True lets the pipeliner prefetch the next
+    # tile's k-blocks while the current tile's epilogue runs
+    num_pid_n = tl.cdiv(N, BN)
+    num_pid_m = tl.cdiv(M, BM)
+    num_tiles = num_pid_n * num_pid_m
+    k_tiles = K // BK
+    num_pid_in_group = GROUP_M * num_pid_n
+    for tile in tl.range(tl.program_id(0), num_tiles, NUM_PROGS, flatten=FLATTEN, num_stages=NUM_STAGES):
+        group_id = tile // num_pid_in_group
+        first_m = group_id * GROUP_M
+        gsz = min(num_pid_m - first_m, GROUP_M)
+        pid_m = first_m + (tile % num_pid_in_group) % gsz
+        pid_n = (tile % num_pid_in_group) // gsz
+        n0 = pid_n * BN
+        m0 = pid_m * BM
+        rn = (n0 + tl.arange(0, BN)) % N
+        acc = tl.zeros((BN, BM), dtype=tl.float32)
+        for it in range(k_tiles):
+            k0 = it * BK
+            q = q_desc.load([k0 // 128, n0, (k0 % 128) // 8]).reshape(BN, BK // 8)
+            xt = tl.trans(x_desc.load([m0, k0]))
+            s = tl.load(s_ptr + rn * (K // GROUP) + k0 // GROUP)
+            wb = _dequant_scaled(q, tl.broadcast_to(s[:, None], (BN, BK // 8)), BN, BK)
+            acc = tl.dot(wb, xt, acc)
+        y_desc.store([m0, n0], tl.trans(acc).to(tl.bfloat16))
+
+
 def _interleave(codes: torch.Tensor) -> torch.Tensor:
     """codes [N, K] -> int32 [N, K/8]; word 4c+t of each 128-k block holds
     k = 32c + 8g + 2t + e at nibble g + 4e."""
@@ -210,6 +244,15 @@ def _buf(name, numel, dtype, device):
     return b
 
 
+_sms = {}
+
+
+def _num_sms(device):
+    if device not in _sms:
+        _sms[device] = torch.cuda.get_device_properties(device).multi_processor_count
+    return _sms[device]
+
+
 def matmul(x, p):
     M, K = x.shape
     N = p["N"]
@@ -222,6 +265,19 @@ def matmul(x, p):
         bk //= 2
     sk = min(sk, K // bk)
     y = torch.empty(M, N, dtype=torch.bfloat16, device=x.device)
+    pers = int(os.environ.get("TRITON_W4_PERSIST", "0"))
+    if pers and sk == 1 and bk <= 128:
+        nprog = min(tiles, _num_sms(x.device) * pers)
+        xd = TensorDescriptor.from_tensor(x, [bm, bk])
+        qd = TensorDescriptor.from_tensor(p["q"], [1, bn, bk // 8])
+        yd = TensorDescriptor.from_tensor(y, [bm, bn])
+        _w4a16_persistent_kernel[(nprog,)](
+            xd, qd, yd, p["s"], M, N, K,
+            GROUP=128, BN=bn, BM=bm, BK=bk, GROUP_M=8, NUM_STAGES=ns, NUM_PROGS=nprog,
+            FLATTEN=bool(int(os.environ.get("TRITON_W4_FLAT", "1"))),
+            num_warps=nw, num_stages=ns,
+        )
+        return y
     if sk > 1:
         ws = _buf("ws", tiles * sk * bn * bm, torch.float32, x.device)
         cnt = _buf("cnt", tiles, torch.int32, x.device)
