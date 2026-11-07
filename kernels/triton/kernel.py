@@ -228,9 +228,17 @@ def _config(M, N, K):
         if cd(N, 64) * cd(M, 32) <= 640:
             return 64, 32, 128, -264, 4, 4, 1
         return 128, 64, 128, -264, 8, 4, 0
-    if cd(N, 128) * cd(M, 128) < 150:
+    # prefill: persistent kernel (flatten=True), last field = programs per SM
+    if cd(N, 64) * cd(M, 128) <= 132:
+        return 64, 128, 128, 1, 4, 4, 0, 2
+    t128 = cd(N, 128) * cd(M, 128)
+    if t128 < 150:
         return 64, 128, 64, 1, 4, 4, 0
-    return 128, 128, 128, 1, 8, 2, 0  # BK=128 with 3 stages gives NaNs (pipeliner race)
+    # wave-quantisation model: a 128x256 tile costs ~1.76x a 128x128 tile
+    waves = lambda t: cd(t, 132)  # noqa: E731
+    if waves(cd(N, 128) * cd(M, 256)) * 1.76 < waves(t128):
+        return 128, 256, 64, 1, 8, 3, 0, 1
+    return 128, 128, 128, 1, 8, 4, 0, 1
 
 
 _bufs = {}
@@ -256,7 +264,7 @@ def _num_sms(device):
 def matmul(x, p):
     M, K = x.shape
     N = p["N"]
-    bn, bm, bk, sk, nw, ns, sa = _config(M, N, K)
+    bn, bm, bk, sk, nw, ns, sa, *rest = _config(M, N, K)
     tiles = triton.cdiv(M, bm) * triton.cdiv(N, bn)
     if sk < 0:  # auto: aim for ~|sk| CTAs in total
         sk = max(1, min(K // bk, round(-sk / tiles)))
@@ -265,7 +273,7 @@ def matmul(x, p):
         bk //= 2
     sk = min(sk, K // bk)
     y = torch.empty(M, N, dtype=torch.bfloat16, device=x.device)
-    pers = int(os.environ.get("TRITON_W4_PERSIST", "0"))
+    pers = int(os.environ.get("TRITON_W4_PERSIST", rest[0] if rest else 0))
     if pers and sk == 1 and bk <= 128:
         nprog = min(tiles, _num_sms(x.device) * pers)
         xd = TensorDescriptor.from_tensor(x, [bm, bk])
