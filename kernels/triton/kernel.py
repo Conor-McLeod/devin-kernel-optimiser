@@ -177,15 +177,23 @@ def prepare(qw):
 def _config(M, N, K):
     env = os.environ.get("TRITON_W4_CFG")
     if env:
-        bn, bm, bk, sk, nw, ns = map(int, env.split(","))
-        return bn, bm, bk, sk, nw, ns
+        v = list(map(int, env.split(",")))
+        return tuple(v) if len(v) == 7 else tuple(v) + (int(M <= 64),)
+    cd = lambda a, b: (a + b - 1) // b  # noqa: E731
     if M <= 16:
-        return 64, 16, 128, 1, 4, 4
-    if M <= 64:
-        return 64, 64, 128, 1, 4, 4
+        return 64, 16, 128, -264, 4, 4, 1
     if M <= 256:
-        return 128, 64, 128, 1, 4, 4
-    return 128, 128, 64, 1, 8, 4
+        if cd(N, 64) * cd(M, 32) <= 528:
+            return 64, 32, 128, -264, 4, 4, 1
+        return 128, 64, 128, -264, 8, 4, 0
+    t128 = cd(N, 128) * cd(M, 128)
+    if t128 < 100:
+        return 64, 128, 64, 1, 4, 4, 0
+    if t128 < 300:
+        return 128, 128, 128, 1, 8, 3, 1
+    if t128 < 528:
+        return 128, 128, 128, 1, 8, 3, 0
+    return 128, 128, 64, 1, 8, 4, 0
 
 
 _bufs = {}
@@ -202,11 +210,11 @@ def _buf(name, numel, dtype, device):
 def matmul(x, p):
     M, K = x.shape
     N = p["N"]
-    bn, bm, bk, sk, nw, ns = _config(M, N, K)
+    bn, bm, bk, sk, nw, ns, sa = _config(M, N, K)
     tiles = triton.cdiv(M, bm) * triton.cdiv(N, bn)
     if sk < 0:  # auto: aim for ~|sk| CTAs in total
         sk = max(1, min(K // bk, round(-sk / tiles)))
-    sa = int(os.environ.get("TRITON_W4_SA", "1" if M <= 64 else "0")) and bk <= 128
+    sa = sa and bk <= 128
     while K % bk:
         bk //= 2
     sk = min(sk, K // bk)
