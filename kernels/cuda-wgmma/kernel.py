@@ -104,7 +104,7 @@ def matmul(x, p):
     N = p["N"]
     bm, split = (int(v) for v in _OVERRIDE.split(",")) if _OVERRIDE else _config(M, N, K)
     tiles = -(-N // 128) * -(-M // bm)
-    if _PERSIST and split == 1 and tiles > NUM_SMS:
+    if _PERSIST and split == 1 and tiles > NUM_SMS and bm < 256:
         # Persistent data-parallel: the producer prefetches the next tile during the epilogue.
         ipc = -(-tiles // NUM_SMS) * (K // 64)
         return _ext.w4a16_pmm(x, p["wq"], p["s"], _counter_buf(x.device), N, bm, 0, ipc)

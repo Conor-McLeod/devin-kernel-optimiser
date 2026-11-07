@@ -191,12 +191,10 @@ __global__ void __launch_bounds__(384, 1)
     const int s = i % STAGES;
     mbar_wait(&full[s], (i / STAGES) & 1);
     const uint8_t* st = smem + s * C::STAGE_BYTES;
-    const uint4 q = reinterpret_cast<const uint4*>(st + C::X_BYTES)[c * 128 + tid];
-    const __nv_bfloat16* sc = reinterpret_cast<const __nv_bfloat16*>(st + C::X_BYTES + W_BYTES);
-    const __nv_bfloat162 s0b = __bfloat162bfloat162(sc[row]);
-    const __nv_bfloat162 s1b = __bfloat162bfloat162(sc[row + 8]);
-    const uint32_t s0 = *reinterpret_cast<const uint32_t*>(&s0b);
-    const uint32_t s1 = *reinterpret_cast<const uint32_t*>(&s1b);
+    const uint32_t sts = smem_u32(st);
+    const uint4 q = lds128(sts + C::X_BYTES + (c * 128 + tid) * 16);
+    const uint32_t s0 = lds_bf16x2_bcast(sts + C::X_BYTES + W_BYTES + row * 2);
+    const uint32_t s1 = lds_bf16x2_bcast(sts + C::X_BYTES + W_BYTES + (row + 8) * 2);
     dequant8(q.x, s0, s1, a[0]);
     dequant8(q.y, s0, s1, a[1]);
     dequant8(q.z, s0, s1, a[2]);
