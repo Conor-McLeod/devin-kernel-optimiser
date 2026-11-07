@@ -98,10 +98,15 @@ def _config(M, N, K):
     return min(cands, key=lambda c: _est_us(M, N, K, *c))
 
 
-_OVERRIDE = os.environ.get("SCOUT_CFG")  # "bm,split" for config sweeps
+_OVERRIDE = os.environ.get("SCOUT_CFG")  # "bm,split[,persist]" for config sweeps
 
 
 def matmul(x, p):
     M, K = x.shape
-    bm, split = (int(v) for v in _OVERRIDE.split(",")) if _OVERRIDE else _config(M, p["N"], K)
-    return _ext.w4a16_mm(x, p["wq"], p["s"], _counter_buf(x.device), p["N"], bm, split)
+    if _OVERRIDE:
+        v = [int(t) for t in _OVERRIDE.split(",")]
+        bm, split, persist = v[0], v[1], (v[2] if len(v) > 2 else 0)
+    else:
+        bm, split = _config(M, p["N"], K)
+        persist = int(split == 1 and bm >= 64 and M >= 512)
+    return _ext.w4a16_mm(x, p["wq"], p["s"], _counter_buf(x.device), p["N"], bm, split, persist)

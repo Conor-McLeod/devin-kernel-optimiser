@@ -86,26 +86,30 @@ DEVI void dequant8(uint32_t q, uint32_t s0, uint32_t s1, uint32_t* a) {
   a[3] = bf2_sub_mul(lop3_and_or(q >> 12, MASK, EX), OFF, s1);
 }
 
-template <int BM>
+// PERSIST: grid-stride over (n,m) tiles with a separate epilogue buffer, so the producer keeps
+// prefetching the next tile while consumers run the epilogue (split-K must be 1).
+template <int BM, bool PERSIST>
 struct Cfg {
   static constexpr int X_BYTES = BM * BK * 2;
   static constexpr int STAGE_BYTES = ((X_BYTES + W_BYTES + S_BYTES + 1023) / 1024) * 1024;
-  static constexpr int STAGES_RAW = 200 * 1024 / STAGE_BYTES;
-  static constexpr int STAGES = STAGES_RAW > 8 ? 8 : STAGES_RAW;
   static constexpr int EPI_STRIDE = BN + 8;
-  static constexpr int EPI_BYTES = BM * EPI_STRIDE * 2;
+  static constexpr int EPI_BYTES = ((BM * EPI_STRIDE * 2 + 1023) / 1024) * 1024;
+  static constexpr int AVAIL = PERSIST ? (227 * 1024 - 1024 - 256 - EPI_BYTES) : 200 * 1024;
+  static constexpr int STAGES_RAW = AVAIL / STAGE_BYTES;
+  static constexpr int STAGES = STAGES_RAW > 8 ? 8 : STAGES_RAW;
   static constexpr int PIPE_BYTES = STAGES * STAGE_BYTES;
-  static constexpr int BAR_OFF = PIPE_BYTES > EPI_BYTES ? PIPE_BYTES : EPI_BYTES;
+  static constexpr int EPI_OFF = PERSIST ? PIPE_BYTES : 0;
+  static constexpr int BAR_OFF = PERSIST ? PIPE_BYTES + EPI_BYTES : (PIPE_BYTES > EPI_BYTES ? PIPE_BYTES : EPI_BYTES);
   static constexpr int SMEM = 1024 + BAR_OFF + 2 * STAGES * 8 + 16;
   static constexpr int NACC = BM / 2;
 };
 
-template <int BM>
+template <int BM, bool PERSIST>
 __global__ void __launch_bounds__(384, 1)
     w4a16_kernel(const __grid_constant__ CUtensorMap tmx, const uint8_t* __restrict__ wq,
                  const __nv_bfloat16* __restrict__ ws, __nv_bfloat16* __restrict__ y, float* __restrict__ part,
                  int* __restrict__ counters, int M, int N, int K, int kb_per_split) {
-  using C = Cfg<BM>;
+  using C = Cfg<BM, PERSIST>;
   constexpr int STAGES = C::STAGES;
   extern __shared__ uint8_t smem_raw[];
   uint8_t* smem = reinterpret_cast<uint8_t*>((reinterpret_cast<uintptr_t>(smem_raw) + 1023) & ~uintptr_t(1023));
@@ -113,7 +117,10 @@ __global__ void __launch_bounds__(384, 1)
   uint64_t* empty = full + STAGES;
   int* flag = reinterpret_cast<int*>(empty + STAGES);
 
-  const int tile_n = blockIdx.x, tile_m = blockIdx.y, split = blockIdx.z, nsplit = gridDim.z;
+  const int split = PERSIST ? 0 : blockIdx.z, nsplit = PERSIST ? 1 : gridDim.z;
+  const int ntn = (N + BN - 1) / BN;
+  const int ntiles = PERSIST ? ntn * ((M + BM - 1) / BM) : 1;
+  const int t0 = PERSIST ? blockIdx.x : 0, tstep = PERSIST ? gridDim.x : 1;
   const int KB = K / BK, G = K / 128;
   const int kb0 = split * kb_per_split;
   const int kb1 = min(KB, kb0 + kb_per_split);
@@ -132,16 +139,20 @@ __global__ void __launch_bounds__(384, 1)
   if (wg == 0) {
     asm volatile("setmaxnreg.dec.sync.aligned.u32 40;");
     if (tid == 0) {
-      const uint8_t* wsrc = wq + (static_cast<size_t>(tile_n) * KB + kb0) * W_BYTES;
-      const __nv_bfloat16* ssrc = ws + static_cast<size_t>(tile_n) * G * BN;
-      for (int i = 0; i < nk; ++i) {
-        const int s = i % STAGES;
-        if (i >= STAGES) mbar_wait(&empty[s], ((i / STAGES) - 1) & 1);
-        uint8_t* st = smem + s * C::STAGE_BYTES;
-        mbar_expect_tx(&full[s], C::X_BYTES + W_BYTES + S_BYTES);
-        tma_load_2d(st, &tmx, &full[s], (kb0 + i) * BK, tile_m * BM);
-        bulk_load(st + C::X_BYTES, wsrc + static_cast<size_t>(i) * W_BYTES, W_BYTES, &full[s]);
-        bulk_load(st + C::X_BYTES + W_BYTES, ssrc + ((kb0 + i) >> 1) * BN, S_BYTES, &full[s]);
+      int it = 0;
+      for (int tt = t0; tt < ntiles; tt += tstep) {
+        const int tile_n = PERSIST ? tt % ntn : blockIdx.x, tile_m = PERSIST ? tt / ntn : blockIdx.y;
+        const uint8_t* wsrc = wq + (static_cast<size_t>(tile_n) * KB + kb0) * W_BYTES;
+        const __nv_bfloat16* ssrc = ws + static_cast<size_t>(tile_n) * G * BN;
+        for (int i = 0; i < nk; ++i, ++it) {
+          const int s = it % STAGES;
+          if (it >= STAGES) mbar_wait(&empty[s], ((it / STAGES) - 1) & 1);
+          uint8_t* st = smem + s * C::STAGE_BYTES;
+          mbar_expect_tx(&full[s], C::X_BYTES + W_BYTES + S_BYTES);
+          tma_load_2d(st, &tmx, &full[s], (kb0 + i) * BK, tile_m * BM);
+          bulk_load(st + C::X_BYTES, wsrc + static_cast<size_t>(i) * W_BYTES, W_BYTES, &full[s]);
+          bulk_load(st + C::X_BYTES + W_BYTES, ssrc + ((kb0 + i) >> 1) * BN, S_BYTES, &full[s]);
+        }
       }
     }
     return;
@@ -150,12 +161,11 @@ __global__ void __launch_bounds__(384, 1)
   asm volatile("setmaxnreg.inc.sync.aligned.u32 232;");
   const int c = wg - 1, warp = tid / 32, lane = tid % 32, g = lane / 4, t = lane % 4;
   float acc[C::NACC];
-#pragma unroll
-  for (int r = 0; r < C::NACC; ++r) acc[r] = 0.f;
-
   const int row = c * 64 + warp * 16 + g;
   // Stage i: wait for TMA, dequantise into a, issue 4 wgmma, keep one wgmma group in flight.
-  auto step = [&](int i, uint32_t (&a)[4][4]) {
+  int it = 0;
+  auto step = [&](int li, uint32_t (&a)[4][4]) {
+    const int i = it + li;
     const int s = i % STAGES;
     mbar_wait(&full[s], (i / STAGES) & 1);
     const uint8_t* st = smem + s * C::STAGE_BYTES;
@@ -179,12 +189,16 @@ __global__ void __launch_bounds__(384, 1)
 #pragma unroll
     for (int r = 0; r < C::NACC; ++r) fence_reg(acc[r]);
     wg_wait<1>();
-    if (i > 0) {
+    if (li > 0) {
       __syncwarp();
       if (lane == 0) mbar_arrive(&empty[(i - 1) % STAGES]);
     }
   };
   uint32_t a0[4][4], a1[4][4];
+  for (int tt = t0; tt < ntiles; tt += tstep) {
+  const int tile_n = PERSIST ? tt % ntn : blockIdx.x, tile_m = PERSIST ? tt / ntn : blockIdx.y;
+#pragma unroll
+  for (int r = 0; r < C::NACC; ++r) acc[r] = 0.f;
   int i = 0;
   for (; i + 1 < nk; i += 2) {
     step(i, a0);
@@ -194,6 +208,11 @@ __global__ void __launch_bounds__(384, 1)
   wg_wait<0>();
 #pragma unroll
   for (int r = 0; r < C::NACC; ++r) fence_reg(acc[r]);
+  if (PERSIST) {
+    __syncwarp();
+    if (lane == 0) mbar_arrive(&empty[(it + nk - 1) % STAGES]);
+  }
+  it += nk;
 
   if (nsplit > 1) {
     // Split-K: publish fp32 partial; the last CTA of this tile reduces and stores.
@@ -231,15 +250,25 @@ __global__ void __launch_bounds__(384, 1)
 
   // Epilogue: transpose through smem ([m][n] bf16), then 16B coalesced stores.
   consumer_sync();
-  __nv_bfloat16* epi = reinterpret_cast<__nv_bfloat16*>(smem);
-  const int nl = c * 64 + warp * 16 + g;
+  __nv_bfloat16* epi = reinterpret_cast<__nv_bfloat16*>(smem + C::EPI_OFF);
+  {
+    // acc fragment (row n=g/g+8, cols m=2t,2t+1) == stmatrix fragment; .trans writes epi[m][n].
+    const int nbase = c * 64 + warp * 16, mk = lane >> 3, mc = lane & 7;
 #pragma unroll
-  for (int i = 0; i < BM / 8; ++i) {
-    const int m = 8 * i + 2 * t;
-    epi[m * C::EPI_STRIDE + nl] = __float2bfloat16_rn(acc[4 * i]);
-    epi[(m + 1) * C::EPI_STRIDE + nl] = __float2bfloat16_rn(acc[4 * i + 1]);
-    epi[m * C::EPI_STRIDE + nl + 8] = __float2bfloat16_rn(acc[4 * i + 2]);
-    epi[(m + 1) * C::EPI_STRIDE + nl + 8] = __float2bfloat16_rn(acc[4 * i + 3]);
+    for (int i = 0; i < BM / 8; i += 2) {
+      uint32_t r[4];
+#pragma unroll
+      for (int k = 0; k < 4; ++k) {
+        const int i2 = i + (k >> 1), h = k & 1;
+        __nv_bfloat162 v = __floats2bfloat162_rn(acc[4 * i2 + 2 * h], acc[4 * i2 + 2 * h + 1]);
+        r[k] = *reinterpret_cast<uint32_t*>(&v);
+      }
+      const int m = 8 * (i + (mk >> 1)) + mc;
+      const uint32_t addr = smem_u32(epi + m * C::EPI_STRIDE + nbase + 8 * (mk & 1));
+      asm volatile("stmatrix.sync.aligned.m8n8.x4.trans.shared.b16 [%0], {%1, %2, %3, %4};" ::"r"(addr), "r"(r[0]),
+                   "r"(r[1]), "r"(r[2]), "r"(r[3])
+                   : "memory");
+    }
   }
   consumer_sync();
   const int ctid = c * 128 + tid;
@@ -252,6 +281,7 @@ __global__ void __launch_bounds__(384, 1)
       *reinterpret_cast<uint4*>(y + static_cast<size_t>(gm) * N + gn) = v;
     }
   }
+  }  // tile loop
 }
 
 CUtensorMap make_x_map(const void* ptr, int M, int K, int box_m) {
@@ -267,10 +297,20 @@ CUtensorMap make_x_map(const void* ptr, int M, int K, int box_m) {
   return map;
 }
 
-template <int BM>
+int num_sms() {
+  static int n = 0;
+  if (!n) {
+    int dev;
+    cudaGetDevice(&dev);
+    cudaDeviceGetAttribute(&n, cudaDevAttrMultiProcessorCount, dev);
+  }
+  return n;
+}
+
+template <int BM, bool PERSIST>
 void launch(const torch::Tensor& x, const torch::Tensor& wq, const torch::Tensor& ws, torch::Tensor& y,
             torch::Tensor& counters, int N, int split, cudaStream_t stream) {
-  using C = Cfg<BM>;
+  using C = Cfg<BM, PERSIST>;
   const int M = x.size(0), K = x.size(1);
   const int KB = K / BK;
   const int ntiles = (N + BN - 1) / BN, mtiles = (M + BM - 1) / BM;
@@ -279,7 +319,7 @@ void launch(const torch::Tensor& x, const torch::Tensor& wq, const torch::Tensor
   split = (KB + kbps - 1) / kbps;
   static bool attr_set = false;
   if (!attr_set) {
-    cudaFuncSetAttribute(w4a16_kernel<BM>, cudaFuncAttributeMaxDynamicSharedMemorySize, C::SMEM);
+    cudaFuncSetAttribute(w4a16_kernel<BM, PERSIST>, cudaFuncAttributeMaxDynamicSharedMemorySize, C::SMEM);
     attr_set = true;
   }
   torch::Tensor part;
@@ -291,8 +331,9 @@ void launch(const torch::Tensor& x, const torch::Tensor& wq, const torch::Tensor
     part_ptr = part.data_ptr<float>();
   }
   CUtensorMap map = make_x_map(x.data_ptr(), M, K, BM);
-  dim3 grid(ntiles, mtiles, split);
-  w4a16_kernel<BM><<<grid, 384, C::SMEM, stream>>>(
+  if (PERSIST) split = 1;
+  dim3 grid = PERSIST ? dim3(std::min(ntiles * mtiles, num_sms())) : dim3(ntiles, mtiles, split);
+  w4a16_kernel<BM, PERSIST><<<grid, 384, C::SMEM, stream>>>(
       map, wq.data_ptr<uint8_t>(), reinterpret_cast<const __nv_bfloat16*>(ws.data_ptr()),
       reinterpret_cast<__nv_bfloat16*>(y.data_ptr()), part_ptr, counters.data_ptr<int>(), M, N, K, kbps);
 }
@@ -300,17 +341,26 @@ void launch(const torch::Tensor& x, const torch::Tensor& wq, const torch::Tensor
 }  // namespace
 
 torch::Tensor w4a16_mm(torch::Tensor x, torch::Tensor wq, torch::Tensor ws, torch::Tensor counters, int64_t N,
-                       int64_t bm, int64_t split) {
+                       int64_t bm, int64_t split, int64_t persist) {
   TORCH_CHECK(x.is_contiguous() && x.scalar_type() == torch::kBFloat16);
   const at::cuda::CUDAGuard guard(x.device());
   auto y = torch::empty({x.size(0), N}, x.options());
   cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  if (persist && split == 1) {
+    switch (bm) {
+      case 64: launch<64, true>(x, wq, ws, y, counters, N, 1, stream); break;
+      case 128: launch<128, true>(x, wq, ws, y, counters, N, 1, stream); break;
+      case 256: launch<256, true>(x, wq, ws, y, counters, N, 1, stream); break;
+      default: TORCH_CHECK(false, "bad bm for persist");
+    }
+    return y;
+  }
   switch (bm) {
-    case 16: launch<16>(x, wq, ws, y, counters, N, split, stream); break;
-    case 32: launch<32>(x, wq, ws, y, counters, N, split, stream); break;
-    case 64: launch<64>(x, wq, ws, y, counters, N, split, stream); break;
-    case 128: launch<128>(x, wq, ws, y, counters, N, split, stream); break;
-    case 256: launch<256>(x, wq, ws, y, counters, N, split, stream); break;
+    case 16: launch<16, false>(x, wq, ws, y, counters, N, split, stream); break;
+    case 32: launch<32, false>(x, wq, ws, y, counters, N, split, stream); break;
+    case 64: launch<64, false>(x, wq, ws, y, counters, N, split, stream); break;
+    case 128: launch<128, false>(x, wq, ws, y, counters, N, split, stream); break;
+    case 256: launch<256, false>(x, wq, ws, y, counters, N, split, stream); break;
     default: TORCH_CHECK(false, "bad bm");
   }
   return y;
