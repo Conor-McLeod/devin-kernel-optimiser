@@ -96,9 +96,16 @@ def _config(M, N, K):
 
 
 _OVERRIDE = os.environ.get("CUDA_WGMMA_CFG")  # "bm,split" for config sweeps
+_PERSIST = os.environ.get("CUDA_WGMMA_PERSIST", "1") != "0"
 
 
 def matmul(x, p):
     M, K = x.shape
-    bm, split = (int(v) for v in _OVERRIDE.split(",")) if _OVERRIDE else _config(M, p["N"], K)
-    return _ext.w4a16_mm(x, p["wq"], p["s"], _counter_buf(x.device), p["N"], bm, split)
+    N = p["N"]
+    bm, split = (int(v) for v in _OVERRIDE.split(",")) if _OVERRIDE else _config(M, N, K)
+    tiles = -(-N // 128) * -(-M // bm)
+    if _PERSIST and split == 1 and tiles > NUM_SMS:
+        # Persistent data-parallel: the producer prefetches the next tile during the epilogue.
+        ipc = -(-tiles // NUM_SMS) * (K // 64)
+        return _ext.w4a16_pmm(x, p["wq"], p["s"], _counter_buf(x.device), N, bm, 0, ipc)
+    return _ext.w4a16_mm(x, p["wq"], p["s"], _counter_buf(x.device), N, bm, split)
