@@ -11,10 +11,24 @@
 
 namespace cg = cooperative_groups;
 
+#ifndef STREAM_POLICY
+#define STREAM_POLICY 1
+#endif
 __device__ __forceinline__ uint4 ld_stream(const uint4* p) {
   uint4 r;
+#if STREAM_POLICY == 0
   asm volatile("ld.global.nc.L1::no_allocate.L2::256B.v4.u32 {%0,%1,%2,%3}, [%4];"
                : "=r"(r.x), "=r"(r.y), "=r"(r.z), "=r"(r.w) : "l"(p));
+#else
+  uint64_t pol;
+#if STREAM_POLICY == 1
+  asm volatile("createpolicy.fractional.L2::evict_first.b64 %0, 1.0;" : "=l"(pol));
+#else
+  asm volatile("createpolicy.fractional.L2::evict_last.b64 %0, 1.0;" : "=l"(pol));
+#endif
+  asm volatile("ld.global.nc.L1::no_allocate.L2::cache_hint.L2::256B.v4.u32 {%0,%1,%2,%3}, [%4], %5;"
+               : "=r"(r.x), "=r"(r.y), "=r"(r.z), "=r"(r.w) : "l"(p), "l"(pol));
+#endif
   return r;
 }
 
@@ -61,8 +75,13 @@ __device__ __forceinline__ void dequant(uint32_t q, uint32_t (&r)[4]) {
   }
 }
 
+#ifndef MINB_THREADS
+#define MINB_THREADS(T, U, MB) ((T) * (U) * (MB) <= 2 ? 1536 : 1024)
+#endif
+#define MINB_FOR(T, U, MB, WC) (MINB_THREADS(T, U, MB) / ((WC) * 32) > 0 ? MINB_THREADS(T, U, MB) / ((WC) * 32) : 1)
+
 template <int T, int U, int MB, int WC, int S>
-__global__ void __launch_bounds__(WC * 32)
+__global__ void __launch_bounds__(WC * 32, MINB_FOR(T, U, MB, WC))
 w4a16_decode_kernel(const uint4* __restrict__ W, const uint32_t* __restrict__ Sc,
                     const __nv_bfloat16* __restrict__ X, __nv_bfloat16* __restrict__ Y,
                     int M, int N, int K) {
@@ -82,22 +101,6 @@ w4a16_decode_kernel(const uint4* __restrict__ W, const uint32_t* __restrict__ Sc
     if (kb0 + u < KB) {
 #pragma unroll
       for (int i = 0; i < T; ++i) wq[i][u] = ld_stream(W + ((size_t)(nt0 + i) * KB + kb0 + u) * 32 + lane);
-    }
-  }
-  uint4 xr[U][MB][2];
-#pragma unroll
-  for (int u = 0; u < U; ++u) {
-#pragma unroll
-    for (int mb = 0; mb < MB; ++mb) {
-      const int m = mb * 8 + g;
-      if (m < M && kb0 + u < KB) {
-        const uint4* p = reinterpret_cast<const uint4*>(X + (size_t)m * K + (kb0 + u) * 64 + 16 * t);
-        xr[u][mb][0] = ld_x(p);
-        xr[u][mb][1] = ld_x(p + 1);
-      } else {
-        xr[u][mb][0] = make_uint4(0, 0, 0, 0);
-        xr[u][mb][1] = make_uint4(0, 0, 0, 0);
-      }
     }
   }
   uint32_t sc[T][U];
@@ -120,6 +123,19 @@ w4a16_decode_kernel(const uint4* __restrict__ W, const uint32_t* __restrict__ Sc
 #pragma unroll
   for (int u = 0; u < U; ++u) {
     if (kb0 + u < KB) {
+      uint4 xr[MB][2];
+#pragma unroll
+      for (int mb = 0; mb < MB; ++mb) {
+        const int m = mb * 8 + g;
+        if (m < M) {
+          const uint4* p = reinterpret_cast<const uint4*>(X + (size_t)m * K + (kb0 + u) * 64 + 16 * t);
+          xr[mb][0] = ld_x(p);
+          xr[mb][1] = ld_x(p + 1);
+        } else {
+          xr[mb][0] = make_uint4(0, 0, 0, 0);
+          xr[mb][1] = make_uint4(0, 0, 0, 0);
+        }
+      }
 #pragma unroll
       for (int i = 0; i < T; ++i) {
         uint32_t a[4][4];
@@ -132,10 +148,10 @@ w4a16_decode_kernel(const uint4* __restrict__ W, const uint32_t* __restrict__ Sc
 #pragma unroll
         for (int mb = 0; mb < MB; ++mb) {
           float p[4] = {0.f, 0.f, 0.f, 0.f};
-          mma_bf16(p, a[0], xr[u][mb][0].x, xr[u][mb][0].y);
-          mma_bf16(p, a[1], xr[u][mb][0].z, xr[u][mb][0].w);
-          mma_bf16(p, a[2], xr[u][mb][1].x, xr[u][mb][1].y);
-          mma_bf16(p, a[3], xr[u][mb][1].z, xr[u][mb][1].w);
+          mma_bf16(p, a[0], xr[mb][0].x, xr[mb][0].y);
+          mma_bf16(p, a[1], xr[mb][0].z, xr[mb][0].w);
+          mma_bf16(p, a[2], xr[mb][1].x, xr[mb][1].y);
+          mma_bf16(p, a[3], xr[mb][1].z, xr[mb][1].w);
           acc[i][mb][0] = fmaf(slo, p[0], acc[i][mb][0]);
           acc[i][mb][1] = fmaf(slo, p[1], acc[i][mb][1]);
           acc[i][mb][2] = fmaf(shi, p[2], acc[i][mb][2]);
