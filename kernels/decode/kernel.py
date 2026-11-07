@@ -1,4 +1,6 @@
-"""decode: Hopper W4A16 GEMM specialised for small M (decode).
+"""decode: Hopper W4A16 GEMM. M<=16: swap-AB mma.sync streaming kernel (w4a16_decode.cu).
+M>16: swap-AB RS-wgmma + TMA warp-specialised kernel (wgmma.cu, mainloop from agent/cuda-wgmma)
+with a 'tail split' schedule picked by simulating the CTA scheduler over 132 SMs.
 
 Default path (tma.cu): persistent, warp-specialised. One CTA per SM streams a contiguous
 range of the repacked weight with cp.async.bulk + mbarrier into an smem ring; consumer
@@ -28,9 +30,10 @@ def _ext(name):
         pol = os.environ.get("DECODE_POLICY", "0")
         build = _HERE / f"build_{name}_p{pol}"
         build.mkdir(exist_ok=True)
-        src = {"tma": "tma.cu", "oneshot": "w4a16_decode.cu"}[name]
+        src = {"tma": "tma.cu", "oneshot": "w4a16_decode.cu", "wgmma": "wgmma.cu"}[name]
+        flags = _FLAGS + [f"-DSTREAM_POLICY={pol}", f"-I{_HERE}"]
         _mods[name] = load(name=f"decode_{name}_p{pol}_ext", sources=[str(_HERE / src)],
-                           extra_cuda_cflags=_FLAGS + [f"-DSTREAM_POLICY={pol}"],
+                           extra_cuda_cflags=flags, extra_ldflags=["-lcuda"] if name == "wgmma" else [],
                            build_directory=str(build), verbose=False)
         _nsm = torch.cuda.get_device_properties(0).multi_processor_count
     return _mods[name]
@@ -57,10 +60,12 @@ def prepare(qw):
     s = qw.scales.view(NT, 2, 8, G).permute(0, 3, 2, 1).contiguous().view(torch.int32).view(NT, G, 8)
     # units: [NT, G, 2 blocks * 128 words + 8 scale words] = 1056 B each
     units = torch.cat([words.view(NT, G, 256), s], dim=-1).contiguous()
-    p = {"w": words, "s": s.contiguous(), "u": units, "N": N, "K": K,
+    p = _prepare_wgmma(qw)
+    p.update({"w": words, "s": s.contiguous(), "u": units, "N": N, "K": K,
          "ws": torch.zeros(16, N, dtype=torch.float32, device=c.device),
-         "cnt": torch.zeros(NT, dtype=torch.int32, device=c.device)}
+         "cnt": torch.zeros(NT, dtype=torch.int32, device=c.device)})
     _ext(_impl())
+    _ext("wgmma")
     return p
 
 
@@ -98,9 +103,103 @@ def _pick_oneshot(M, N, K):
     return best[1]
 
 
+def _prepare_wgmma(qw):
+    # agent/cuda-wgmma layout: wq [Np/128, K/64, 4096] B (m64k16 A fragments), scales [Np/128, K/128, 128]
+    N, K = qw.N, qw.K
+    Np = (N + 127) // 128 * 128
+    codes, scales = qw.codes, qw.scales
+    if Np != N:
+        codes = torch.cat([codes, torch.full((Np - N, K), 8, dtype=codes.dtype, device=codes.device)])
+        scales = torch.cat([scales, torch.zeros(Np - N, K // 128, dtype=scales.dtype, device=scales.device)])
+    NT, KB = Np // 128, K // 64
+    c = codes.to(torch.int64).view(NT, 2, 4, 2, 8, KB, 4, 2, 4, 2)
+    c = c.permute(0, 5, 1, 2, 4, 8, 6, 9, 7, 3).reshape(NT, KB, 2, 4, 8, 4, 4, 8)
+    shifts = torch.arange(8, device=codes.device, dtype=torch.int64) * 4
+    words = (c << shifts).sum(-1)
+    words = torch.where(words >= 2**31, words - 2**32, words).to(torch.int32)
+    wq = words.contiguous().view(torch.uint8).view(NT, KB, 4096)
+    sc = scales.view(NT, 128, K // 128).permute(0, 2, 1).contiguous()
+    return {"wq": wq, "wsc": sc}
+
+
+_BMS = (16, 32, 64, 128, 256)
+_SPLITS = (1, 2, 3, 4, 6, 8)
+_sched = {}
+_bufs = {}
+
+
+def _kb_cost(bm):
+    return max(0.22, 0.09 + 0.0022 * bm)  # us per 128x(bm)x64 block (cuda-wgmma fit)
+
+
+def _sim(M, N, K, bm, D, S):
+    import heapq
+    nsm = _nsm or 132
+    KB = K // 64
+    T = -(-N // 128) * -(-M // bm)
+    R = T - D
+    kbps = -(-KB // S)
+    c = _kb_cost(bm)
+    durs = [0.3 + KB * c] * D + [0.3 + kbps * c] * (R * S)
+    if len(durs) <= nsm:
+        t = max(durs)
+    else:
+        h = [0.0] * nsm
+        for d in durs:
+            heapq.heapreplace(h, h[0] + d)
+        t = max(h)
+    if R > 0 and S > 1:
+        t += 1.0 + R * S * bm * 128 * 8 / 2e6
+    return t
+
+
+def _wg_cfg(M, N, K):
+    key = (M, N, K)
+    if key in _sched:
+        return _sched[key]
+    env = os.environ.get("DECODE_WG")
+    if env:
+        cfg = tuple(int(v) for v in env.split(","))
+    else:
+        nsm = _nsm or 132
+        KB = K // 64
+        best = None
+        for bm in _BMS:
+            if not (bm <= 16 or bm // 2 < M):
+                continue
+            T = -(-N // 128) * -(-M // bm)
+            for S in _SPLITS:
+                if S > KB:
+                    continue
+                Rs = {0} if S == 1 else {T, T % nsm, T % nsm + nsm}
+                for R in Rs:
+                    if R > T or (S > 1 and R == 0):
+                        continue
+                    t = _sim(M, N, K, bm, T - R, S)
+                    if best is None or t < best[0]:
+                        best = (t, (bm, T - R, S))
+        cfg = best[1]
+    _sched[key] = cfg
+    return cfg
+
+
+def _wg_bufs(dev, nfloat):
+    b = _bufs.get(dev)
+    if b is None or b[1].numel() < nfloat:
+        cnt = torch.zeros(1 << 16, dtype=torch.int32, device=dev) if b is None else b[0]
+        b = (cnt, torch.empty(max(nfloat, 1 << 20), dtype=torch.float32, device=dev))
+        _bufs[dev] = b
+    return b
+
+
 def matmul(x, p):
     M, K = x.shape
     N = p["N"]
+    if M > 16:
+        bm, D, S = _wg_cfg(M, N, K)
+        T = -(-N // 128) * -(-M // bm)
+        cnt, part = _wg_bufs(x.device, (T - D) * S * bm * 128)
+        return _ext("wgmma").w4a16_mm(x, p["wq"], p["wsc"], cnt, part, N, bm, D, S)
     y = torch.empty(M, N, dtype=torch.bfloat16, device=x.device)
     impl = _impl()
     ext = _ext(impl)
