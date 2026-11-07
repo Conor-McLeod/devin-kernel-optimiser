@@ -28,7 +28,7 @@ def _ext(name):
         from torch.utils.cpp_extension import load
 
         pol = os.environ.get("DECODE_POLICY", "0")
-        occ = os.environ.get("DECODE_OCC2", "1")
+        occ = os.environ.get("DECODE_OCC2", "0")
         tag = f"p{pol}o{occ}" if name == "wgmma" else f"p{pol}"
         build = _HERE / f"build_{name}_{tag}"
         build.mkdir(exist_ok=True)
