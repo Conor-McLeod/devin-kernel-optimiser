@@ -58,17 +58,17 @@ def _ctas(N, M, nwg, bm):
 
 
 def _config(M, N, K):
-    """(num_wg, BM, BK, split, stages); thresholds fitted to ncu sweeps (132 SMs)."""
+    """(num_wg, BM, BK, split, stages): largest tile giving >= 64 CTAs, then split-K
+    towards ~132 CTAs. Fitted to ncu sweeps on 132-SM H100."""
     bk = 128 if (K // 128) % 2 == 0 else 64
-    if M <= 16:
-        nwg, bm, stages, target = 1, 16, 4, 132
-    else:
-        for nwg, bm, stages, target in ((1, 32, 4, 264), (1, 64, 4, 264), (2, 128, 0, 132)):
-            if _ctas(N, M, nwg, bm) <= 264:
-                break
+    tiles = [t for t in ((2, 128, 0), (1, 64, 4), (1, 32, 4), (1, 16, 4)) if t[1] <= max(16, M)]
+    for nwg, bm, stages in tiles:
+        if _ctas(N, M, nwg, bm) >= 64:
+            break
     ctas = _ctas(N, M, nwg, bm)
+    max_split = 4 if bm == 16 else 2
     split = 1
-    while (split < 8 and ctas * split * 2 <= target and (K // bk) % (4 * split) == 0
+    while (split < max_split and ctas * split * 2 <= 132 and (K // bk) % (4 * split) == 0
            and (2 * split - 1) * 64 * nwg * bm * 4 <= 72 * 1024):
         split *= 2
     return (nwg, bm, bk, split, stages)
