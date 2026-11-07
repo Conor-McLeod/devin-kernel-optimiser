@@ -21,7 +21,7 @@ _sg = None
 def _import():
     global _sg
     if _sg is None:
-        from sglang.kernels.ops.quantization import gptq_marlin_repack
+        from sglang.kernels.ops.quantization.gptq_marlin_repack import gptq_marlin_repack
         from sglang.srt.layers.quantization import marlin_utils as mu
 
         _sg = (gptq_marlin_repack, mu)

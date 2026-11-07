@@ -9,7 +9,7 @@ H=/opt/hackathon
 
 echo "== system packages"
 sudo apt-get update -y
-sudo apt-get install -y git build-essential tmux curl jq ffmpeg
+sudo apt-get install -y git build-essential tmux curl jq ffmpeg python3-dev  # python3-dev: Triton compiles a C helper against Python.h
 
 echo "== GPU / CUDA toolkit"
 [[ -d /usr/local/cuda/bin ]] && export PATH=/usr/local/cuda/bin:$PATH
