@@ -99,7 +99,8 @@ def main() -> None:
             "prompt": build_prompt(a, env.get("REPO_NAME", "devin-kernel-optimiser")),
             "title": f"kernel agent: {a}",
             "tags": ["hackathon", "kernels", a],
-            "platform": env.get("OUTPOST", "h100-kernels"),
+            # API pool name can differ from the worker's outpost name (personal pools are "user:<name>").
+            "platform": env.get("SESSION_PLATFORM") or env.get("OUTPOST", "h100-kernels"),
         }
         if args.max_acu:
             body["max_acu_limit"] = args.max_acu
