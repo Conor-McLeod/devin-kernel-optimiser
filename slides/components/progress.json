@@ -1,0 +1,170 @@
+[
+ {
+  "agent": "cuda-wgmma",
+  "t": 16.2,
+  "gm": 1.3735,
+  "v": "v1",
+  "note": "v1: swap-AB wgmma RS, TMA x, bulk W, 2 consumer WGs, split-K, wait0",
+  "run": "e2e9fcde"
+ },
+ {
+  "agent": "cute-dsl",
+  "t": 18.3,
+  "gm": 1.3341,
+  "v": "v1",
+  "note": "v1 swapped RS-wgmma, BN=128 BM=128 BK=64, sync wgmma wait",
+  "run": "25ef0ea0"
+ },
+ {
+  "agent": "cute-dsl",
+  "t": 20.4,
+  "gm": 1.2659,
+  "v": "v2",
+  "note": "v2: ping-pong A regs, dequant overlaps in-flight wgmma (wait_group(1))",
+  "run": "ed420f6f"
+ },
+ {
+  "agent": "cute-dsl",
+  "t": 23.9,
+  "gm": 1.2894,
+  "v": "v3",
+  "note": "v3: TVM-FFI launch (host overhead 30us->8us), ping-pong A",
+  "run": "e4b8ea10"
+ },
+ {
+  "agent": "cute-dsl",
+  "t": 25.5,
+  "gm": 0.9348,
+  "v": "v4",
+  "note": "v4: cluster split-K 1x1xS with DSMEM reduction, S chosen to fill 132 SMs",
+  "run": "95d5ad53"
+ },
+ {
+  "agent": "triton",
+  "t": 30.4,
+  "gm": 1.3928,
+  "v": "v2",
+  "note": "v2: swap-AB wgmma, block qweight layout, PTX lop3 dequant, per-M/tile-count cfg table, spl",
+  "run": "1c194dd2"
+ },
+ {
+  "agent": "cuda-wgmma",
+  "t": 31.5,
+  "gm": 1.5545,
+  "v": "v2",
+  "note": "v2: wgmma wait_group1 + double-buffered A regs, fitted (bm,split) cost model",
+  "run": "3b77b284"
+ },
+ {
+  "agent": "cute-dsl",
+  "t": 32.5,
+  "gm": 1.3649,
+  "v": "v5",
+  "note": "v5: BK=128, split-K via remote st.shared::cluster push to rank0 + local reduce",
+  "run": "57ba145f"
+ },
+ {
+  "agent": "cute-dsl",
+  "t": 37.4,
+  "gm": 1.4659,
+  "v": "v6",
+  "note": "v6: config table from ncu sweeps: BN64xBM32/64 + stage cap 4 (multi-CTA/SM) for mid, split",
+  "run": "a319b6b7"
+ },
+ {
+  "agent": "triton",
+  "t": 38.4,
+  "gm": 1.476,
+  "v": "v3",
+  "note": "v3: TMA descriptor loads for x and packed W (mbarrier pipeline, fewer bar.sync stalls), re",
+  "run": "d13f1ef6"
+ },
+ {
+  "agent": "cute-dsl",
+  "t": 39.6,
+  "gm": 1.5224,
+  "v": "v7",
+  "note": "v7: pick largest tile with >=64 CTAs, split-K to ~132 CTAs (max 4 at BM16, 2 otherwise)",
+  "run": "0d327cbf"
+ },
+ {
+  "agent": "triton",
+  "t": 41.3,
+  "gm": 1.5912,
+  "v": "v4",
+  "note": "v4: 64x128x64 no-split tile for M=128-256 when >=132 tiles",
+  "run": "8ec830c1"
+ },
+ {
+  "agent": "cute-dsl",
+  "t": 54.1,
+  "gm": 1.5641,
+  "v": "v8",
+  "note": "v8: prefill 128x256 tiles chosen by wave count; BN64xBM128 for short K",
+  "run": "ca24e0c2"
+ },
+ {
+  "agent": "triton",
+  "t": 56.5,
+  "gm": 1.6335,
+  "v": "v5",
+  "note": "v5: persistent flatten prefill, 128x256 tiles via wave model",
+  "run": "304f9742"
+ },
+ {
+  "agent": "triton",
+  "t": 62.4,
+  "gm": 1.5699,
+  "v": "v5",
+  "note": "v5 final: persistent flatten prefill (128x256 / 128x128 / 64x128 by wave model) @652ad34",
+  "run": "d7ddd358"
+ },
+ {
+  "agent": "triton",
+  "t": 62.7,
+  "gm": 1.6312,
+  "v": "v5",
+  "note": "v5 final rerun (decode noise check) @652ad34",
+  "run": "bb49c7c1"
+ },
+ {
+  "agent": "cute-dsl",
+  "t": 64.4,
+  "gm": 1.5522,
+  "v": "v9",
+  "note": "v9: persistent 128x256 prefill + 128x64 epi subtiles",
+  "run": "315c5e79"
+ },
+ {
+  "agent": "cuda-wgmma",
+  "t": 65.7,
+  "gm": 1.5387,
+  "v": "v3",
+  "note": "v3: explicit ld.shared W frags (was generic LD.E), stmatrix epilogue (scout #50), BM 96/19",
+  "run": "d625fa69"
+ },
+ {
+  "agent": "cuda-wgmma",
+  "t": 68.6,
+  "gm": 1.651,
+  "v": "v3.1",
+  "note": "v3.1: explicit ld.shared W frags, stmatrix epilogue (scout #50), BM 96/192; persistent off",
+  "run": "53a2b4ed"
+ },
+ {
+  "agent": "cuda-wgmma",
+  "t": 73.5,
+  "gm": 1.6677,
+  "v": "v3.1",
+  "note": "v3.1 rerun (noise check) @653ae31",
+  "run": "29986cc3"
+ },
+ {
+  "agent": "decode",
+  "t": 110.1,
+  "gm": 1.7202,
+  "v": "v2",
+  "note": "decode v2: decode mma.sync M<=16 + persistent RS-wgmma/TMA, stmatrix+TMA-store epilogue, r",
+  "run": "3202b64f"
+ }
+]

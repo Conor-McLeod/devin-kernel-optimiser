@@ -25,6 +25,8 @@ One-liner: we pointed a team of Devin agents at a real production kernel and let
 
 # What is W4A16?
 
+<div class="text-sm opacity-80 -mt-2 mb-3">A quantisation scheme: model <b>W</b>eights stored in <b>4</b> bits, <b>A</b>ctivations kept in <b>16</b>-bit bf16, so the model is ~4× smaller</div>
+
 <W4A16Explainer />
 
 <!--
@@ -59,7 +61,7 @@ On **every H100** serving those models, it runs an **Ampere-era** design:
 
 | | Marlin | H100 peak |
 |---|---|---|
-| Prefill (large M) | ~335 TFLOP/s | 989 TFLOP/s |
+| Prefill (large M) | ~350 TFLOP/s | 989 TFLOP/s |
 | Decode (M ≤ 16) | ~1.0 TB/s | 3.35 TB/s |
 
 <div class="mt-6 text-sm opacity-80">
@@ -70,6 +72,18 @@ Scout's Nsight profile: 1 CTA/SM, 255 registers ⇒ <b>12.5% occupancy</b>; tens
 
 <!--
 The point: a kernel that is everywhere in production, but leaves most of the Hopper hardware unused. Real headroom, real impact.
+-->
+
+---
+
+# The shapes we benchmark
+
+<GemmShapes />
+
+<!--
+Every linear layer in Qwen3.6-35B-A3B is one of these five weight matrices. W is fixed; M (tokens in flight) is what varies.
+Pick linattn_qkvz, drag M from 1 to 4096: at M=1 x is a single line and the GPU just streams 13 MB of weights. By 4096 it's a fat block doing 100B multiply-adds.
+Then expert_down: tiny matrix, hard to keep the whole GPU busy.
 -->
 
 ---
@@ -94,6 +108,8 @@ flowchart LR
 
 # Five agents, one per DSL
 
+<div class="text-sm">
+
 | Agent | Language | Brief |
 |---|---|---|
 | **scout** | n/a | Verify the baselines, profile Marlin with Nsight, post roofline floors |
@@ -102,11 +118,17 @@ flowchart LR
 | **triton** | Triton | Best overall geomean, autotuned per batch size |
 | **decode** | CUDA C++ | M ≤ 16, where everything is memory-bandwidth-bound |
 
-<div class="mt-8">
+</div>
+
+<div class="mt-4 text-sm">
 
 Every agent gets the same contract:
 `prepare(W)` repacks the weights untimed → `matmul(x, prepared)` is timed
 
+</div>
+
+<div class="mt-2 text-sm opacity-80">
+Phase 2, ~48 min in: every agent got one new goal, <b>prefill (M ≥ 512)</b>, the gap to cuBLAS on dequantised weights
 </div>
 
 ---
@@ -154,39 +176,46 @@ A tiny FastAPI + SQLite service on the VM. Agents read it before starting and af
 </div>
 
 <div class="mt-10 text-sm opacity-80">
-In ~30 minutes: <b>49 posts</b> (25 findings, 6 claims, 18 results) and <b>3,700+ timed benchmark points</b>, most of them quiet iteration runs not posted to the board
+In ~100 minutes: <b>85 posts</b> (38 findings, 6 claims, 41 results) and <b>10,000+ timed benchmark points</b> across ~400 runs, most of them quiet iteration runs not posted to the board
 </div>
 
 ---
 
-# Results: ~30 minutes of agent time
+# Results: ~100 minutes of agent time
 
-<div class="text-sm opacity-70 mb-2">Geomean speedup vs sglang Marlin · 5 Qwen3.6-35B-A3B shapes × 11 batch sizes (55 points) · 0 incorrect results</div>
+<div class="text-sm opacity-70 mb-2">Geomean speedup vs sglang Marlin · 5 Qwen3.6-35B-A3B shapes × 11 batch sizes · best full run per agent · 0 incorrect</div>
 
-<div class="text-sm">
-
-| Kernel | Language | Overall | Decode (M≤16) | Mid (32–256) | Prefill (≥512) | Wins |
-|---|---|---|---|---|---|---|
-| **triton** | Triton | **1.59×** | 1.27× | **1.94×** | 1.54× | 53/55 |
-| **cuda-wgmma** | CUDA / PTX | 1.55× | 1.12× | 1.85× | **1.67×** | 49/55 |
-| **cute-dsl** | CuTe DSL | 1.52× | 1.18× | 1.84× | 1.52× | 52/55 |
-| **decode** | CUDA | *M ≤ 16 only* | **1.48×** | | | |
-| vLLM Machete *(Hopper-native ref)* | CUTLASS | 1.32× | 0.87× | 1.49× | 1.61× | 41/55 |
-| sglang Marlin *(baseline)* | CUDA | 1.00× | 1.00× | 1.00× | 1.00× | |
-
-</div>
+<ResultsHeatmap />
 
 <div class="mt-4 grid grid-cols-2 gap-6 text-sm">
 <div class="border-l-4 border-green-400 pl-3">
-<b>All three general kernels beat Marlin and vLLM's Machete</b> in three different languages
+<b>All four kernels beat Marlin and vLLM's Machete</b>, in three different languages
 </div>
 <div class="border-l-4 border-blue-400 pl-3">
-<b>Peak: ~690 TFLOP/s</b> at M=4096 (cuda-wgmma) vs Marlin's ~335 ⇒ about <b>70% of H100 dense peak</b>
+<b>Peak: ~800 TFLOP/s</b> at M=4096 (decode, linattn_qkvz) vs Marlin's ~350 ⇒ about <b>80% of H100 dense peak</b>
 </div>
 </div>
 
 <!--
-Agents launched ~13:53; triton and cute-dsl posted FINAL at ~14:24.
+Two phases. First ~45 min: general kernels plus a decode specialist; triton and cute-dsl posted FINAL at ~1.55-1.6x.
+Then every agent got a new goal: prefill (M>=512), the gap to torch_dequant.
+decode used that to build a Hopper wgmma+TMA path for M>16 on top of cuda-wgmma's #28, keeping its own M<=16 kernel, and took first place: the only kernel to win all 55 points.
+-->
+
+---
+
+# How they got there
+
+<div class="text-sm opacity-70 mb-1">Every full 55-point, all-correct run · line = best so far · hover a dot for its change</div>
+
+<ProgressChart />
+
+<!--
+Each dot is one full benchmark run; the step line is the agent's best so far.
+First kernels already beat Marlin (1.3-1.4x) about 16 minutes in. They then climbed by reading each other's findings: swap-AB, TMA loads, persistent prefill tiles, stmatrix epilogue.
+cute-dsl v4 tried cluster split-K with a DSMEM reduction and fell below Marlin; v5 reworked the split-K (BK=128, remote st.shared) and recovered. Rerun dots are noise checks.
+Dotted line: every agent was redirected to prefill. cuda-wgmma's v3/v3.1 and decode's single pink dot at the far right come from that phase.
+decode only appears once: before the redirect it ran M>16 as a stopgap loop of 16-row chunks (0.32x overall), so its earlier full runs aren't comparable. Scout's prefill-only runs aren't shown.
 -->
 
 ---
@@ -212,14 +241,14 @@ Projected from measured runs (best kernel per point), not yet a single submitted
 
 | | Router |
 |---|---|
-| **Overall** | **1.75×** |
-| Decode | 1.50× |
-| Mid | 2.03× |
-| Prefill | 1.69× |
+| **Overall** | **1.85×** |
+| Decode | 1.52× |
+| Mid | 2.08× |
+| Prefill | 1.91× |
 | **Wins** | **55 / 55** |
 
 <div class="text-xs mt-4 opacity-80">
-Who wins where: decode takes 12/15 decode points · mid split triton 10, cuda-wgmma 5, cute-dsl 5 · prefill mostly cuda-wgmma (14/20)
+Who wins where: decode takes 13/15 decode points · mid split cuda-wgmma 9, triton 8, cute-dsl 3 · prefill cuda-wgmma 11, decode 8, cute-dsl 1
 </div>
 
 </div>
@@ -243,6 +272,7 @@ Who wins where: decode takes 12/15 decode points · mid split triton 10, cuda-wg
 - **Cap pipeline stages at 4:** filling 227 KB of shared memory forces 1 CTA/SM; 4 stages allow several (attn_o M=128: 23.7 → 15.1 µs)
 - **Cluster split-K: push, don't pull.** Pulling partials via `ld.shared::cluster` gave **0.93×**; pushing with `st.shared::cluster.v4` gave **1.36×**
 - **Fitted cost model** for tile size and split (cuda-wgmma, +0.18×)
+- **Read the SASS:** cuda-wgmma's shared-memory reads compiled to slow generic `LD.E`, not `LDS`; forcing `ld.shared` was its biggest prefill win
 
 ### Dead ends, posted too
 - Triton `warp_specialize`: same or 2× slower
@@ -307,6 +337,7 @@ CORRECTION to #28: the persistent stream-K rewrite was never compiled/benchmarke
 - **Findings crossed languages:** cute-dsl's tile tuning "agrees with triton #26", and triton's TMA switch came from the same barrier-stall diagnosis
 - **Agents corrected themselves in public:** the scout's timing-overhead claim (7 µs → 2.5 µs), cuda-wgmma's untested claim, triton flagging its own run-to-run noise
 - **Specialists offered to compose:** decode proposed the router and promised a stable interface
+- **…and then absorbed others' work:** in phase 2, decode built its prefill path on cuda-wgmma's #28 and went from M ≤ 16 specialist to first overall
 
 </v-clicks>
 
@@ -332,17 +363,18 @@ Switch to the browser here. Show the curves above 1.0 and the feed: scout's retr
 
 # The gap that's left: prefill
 
-`torch_dequant` (convert W to bf16 once, then cuBLAS) still scores **1.93×** at prefill
+`torch_dequant` (convert W to bf16 once, then cuBLAS) scored **1.93×** at prefill, so phase 2 went after it
 
-| Prefill (M ≥ 512) | Speedup |
-|---|---|
-| torch_dequant *(not a W4 kernel)* | 1.93× |
-| router (best agent kernel per point) | 1.69× |
-| cuda-wgmma | 1.67× |
+| Prefill (M ≥ 512) | Phase 1 | Now |
+|---|---|---|
+| torch_dequant *(not a W4 kernel)* | 1.93× | 1.93× |
+| router (best agent kernel per point) | 1.69× | **1.91×** |
+| cuda-wgmma | 1.67× | 1.86× |
+| decode | *M ≤ 16 only* | 1.81× |
 
 - It reads **4× more weight bytes** and keeps a full bf16 copy, so it isn't allowed as a submission
 - It **loses at decode** (0.91×), where memory bandwidth is everything
-- At large M the problem is compute-bound, so cuBLAS's mature bf16 GEMM wins. That's the **next target**: ~70% of peak today, cuBLAS is higher
+- At large M the problem is compute-bound, so the W4 kernels have to match cuBLAS while still dequantising in registers. The router is **within ~1%**; no single kernel is there yet
 
 ---
 
@@ -366,7 +398,7 @@ Verified: several Outpost workers can share one machine (5 on one VM)
 
 <v-clicks>
 
-- **Real result on a real production kernel:** three agents in three languages beat Marlin by **1.5–1.6×** in ~30 minutes, with a combined **1.75×** and 55/55 wins
+- **Real result on a real production kernel:** four agents in three languages beat Marlin by **1.56–1.72×** in ~100 minutes, with a combined **1.85×** and 55/55 wins
 - **Outposts make GPU work possible for Devin:** planning in the cloud, execution on our H100
 - **The harness matters more than the prompts:** a shared GPU lock, hidden shapes and post-timing re-verification keep parallel agents honest
 - **A message board turns 5 agents into a team:** shared profiles and floors, cross-language findings, public corrections, and an auditor that emerged on its own
